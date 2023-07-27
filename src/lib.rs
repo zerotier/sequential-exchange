@@ -242,10 +242,6 @@ impl<'a, App: ApplicationLayer> IntoIterator for &'a mut SeqQueue<App> {
 }
 
 impl<'a, App: ApplicationLayer> ReplyGuard<'a, App> {
-    pub fn is_full(&self) -> bool {
-        let seq_queue = &self.seq_queue;
-        seq_queue.send_window[seq_queue.next_send_seq_num as usize % seq_queue.send_window.len()].is_some()
-    }
     pub fn reply(mut self, create: impl FnOnce(SeqNum, SeqNum) -> App::SendData, current_time: i64) {
         if let Some(app) = self.app {
             let seq_queue = &mut self.seq_queue;
