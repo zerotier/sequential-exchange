@@ -1,11 +1,10 @@
 [package]
-name = "seq_queue"
+name = "seq_ex"
 version = "0.0.1"
 authors = ["Monica Moniot"]
 edition = "2021"
 
 [lib]
-name = "seq_queue"
+name = "seq_ex"
 path = "src/lib.rs"
 doc = true
-

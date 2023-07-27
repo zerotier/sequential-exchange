@@ -1,7 +1,45 @@
+//! The reference implementation of the **Sequential Exchange Protocol**, or SEP.
+//!
+//! SEP is a peer-to-peer transport protocol that guarantees packets of data will always be received
+//! in the same order they were sent. In addition, it also guarantees the sequential consistency of
+//! stateful exchanges between the two communicating peers.
+//!
+//! A "stateful exchange" is defined here as a sequence of packets, where the first packet
+//! initiates the exchange, and all subsequent packets are replies to the previous packet in the
+//! exchange.
+//!
+//! SEP guarantees both peers will agree upon which packets are members of which exchanges,
+//! and it guarantees each packet is received by each peer in sequential order.
+//!
+//! SEP is a tiny, dead simple protocol and we have implemented it here in less than 500 lines of code.
+//!
+//! # Why not TCP?
+//!
+//! TCP only guarantees packets will be received in the same order they were sent.
+//! It has no inherent concept of "replying to a packet" and as such it cannot guarantee both sides
+//! of a conversation have the same view of any stateful exchanges that take place.
+//!
+//! TCP is also much higher overhead. It requires a 1.5 RTT handshake to begin any connection,
+//! it has a larger amount of metadata that must be transported with packets, and it has quite a few
+//! features that slow down runtime regardless of whether or not they are used.
+//! A lot of this overhead owes to TCPs sizeable complexity.
+//!
+//! That being said SEP does lack many of TCP's additional features, such as a dynamic resend timer,
+//! keep-alives, and expiration handling. This can be both a pro and a con, as it means there is a
+//! lot of efficiency to be gained if these features are not needed or are implemented at a
+//! different protocol layer.
+//!
+//! Neither SEP nor TCP are cryptographically secure.
+//!
+//! # Examples
+//!
 #![no_std]
+#![forbid(unsafe_code)]
+//#![warn(missing_docs, missing_debug_implementations, rust_2018_idioms)]
+
 pub type SeqNum = u32;
 
-pub trait ApplicationLayer: Sized {
+pub trait TransportLayer: Sized {
     type RecvData;
     type RecvDataRef<'a>;
     type RecvReturn;
@@ -16,34 +54,34 @@ pub trait ApplicationLayer: Sized {
     fn process(&self, reply_cx: ReplyGuard<'_, Self>, recv_packet: Self::RecvDataRef<'_>, send_data: Option<Self::SendData>) -> Self::RecvReturn;
 }
 
-pub trait IntoRecvData<App: ApplicationLayer>: Into<App::RecvData> {
-    fn as_ref(&self) -> App::RecvDataRef<'_>;
+pub trait IntoRecvData<TL: TransportLayer>: Into<TL::RecvData> {
+    fn as_ref(&self) -> TL::RecvDataRef<'_>;
 }
-impl<AppInner: ApplicationLayer> IntoRecvData<AppInner> for AppInner::RecvData {
-    fn as_ref(&self) -> AppInner::RecvDataRef<'_> {
-        AppInner::deserialize(self)
+impl<TL: TransportLayer> IntoRecvData<TL> for TL::RecvData {
+    fn as_ref(&self) -> TL::RecvDataRef<'_> {
+        TL::deserialize(self)
     }
 }
 
-pub struct SeqQueue<App: ApplicationLayer, const SLEN: usize = 64, const RLEN: usize = 32> {
+pub struct SeqQueue<TL: TransportLayer, const SLEN: usize = 64, const RLEN: usize = 32> {
     pub retry_interval: i64,
     next_send_seq_num: SeqNum,
     pre_recv_seq_num: SeqNum,
-    send_window: [Option<SendEntry<App>>; SLEN],
-    recv_window: [Option<RecvEntry<App>>; RLEN],
+    send_window: [Option<SendEntry<TL>>; SLEN],
+    recv_window: [Option<RecvEntry<TL>>; RLEN],
 }
 
-struct RecvEntry<App: ApplicationLayer> {
+struct RecvEntry<TL: TransportLayer> {
     seq_num: SeqNum,
     reply_num: Option<SeqNum>,
-    data: App::RecvData,
+    data: TL::RecvData,
 }
 
-struct SendEntry<App: ApplicationLayer> {
+struct SendEntry<TL: TransportLayer> {
     seq_num: SeqNum,
     reply_num: Option<SeqNum>,
     next_resent_time: i64,
-    data: App::SendData,
+    data: TL::SendData,
 }
 
 pub enum Error {
@@ -53,16 +91,16 @@ pub enum Error {
 /// Whenever a packet is received, it must be replied to.
 /// This Guard object guarantees that this is the case.
 /// If it is dropped without calling `reply` an empty reply will be sent to the remote peer.
-pub struct ReplyGuard<'a, App: ApplicationLayer> {
-    app: Option<&'a App>,
-    seq_queue: &'a mut SeqQueue<App>,
+pub struct ReplyGuard<'a, TL: TransportLayer> {
+    app: Option<&'a TL>,
+    seq_queue: &'a mut SeqQueue<TL>,
     reply_num: SeqNum,
 }
 
-pub struct Iter<'a, App: ApplicationLayer>(core::slice::Iter<'a, Option<SendEntry<App>>>);
-pub struct IterMut<'a, App: ApplicationLayer>(core::slice::IterMut<'a, Option<SendEntry<App>>>);
+pub struct Iter<'a, TL: TransportLayer>(core::slice::Iter<'a, Option<SendEntry<TL>>>);
+pub struct IterMut<'a, TL: TransportLayer>(core::slice::IterMut<'a, Option<SendEntry<TL>>>);
 
-impl<App: ApplicationLayer> SeqQueue<App> {
+impl<TL: TransportLayer> SeqQueue<TL> {
     pub fn new(retry_interval: i64, initial_seq_num: SeqNum) -> Self {
         Self {
             retry_interval,
@@ -90,9 +128,9 @@ impl<App: ApplicationLayer> SeqQueue<App> {
     /// If true is returned then the packet was successfully sent.
     ///
     /// `packet_data` must contain the latest sequence number returned by `seq_num()`
-    /// There should always be a call to `SeqQueue::seq_num()` preceeding every call to `send_seq`.
+    /// There should always be a call to `SeqQueue::seq_num()` preceding every call to `send_seq`.
     #[must_use = "The queue might be full causing the packet to not be sent"]
-    pub fn send_seq(&mut self, app: App, packet_data: App::SendData, current_time: i64) -> bool {
+    pub fn send_seq(&mut self, app: TL, packet_data: TL::SendData, current_time: i64) -> bool {
         if self.is_full() {
             return false;
         }
@@ -113,11 +151,11 @@ impl<App: ApplicationLayer> SeqQueue<App> {
 
     pub fn receive(
         &mut self,
-        app: App,
+        app: TL,
         seq_num: SeqNum,
         reply_num: Option<SeqNum>,
-        packet: impl IntoRecvData<App>,
-    ) -> Result<App::RecvReturn, Error> {
+        packet: impl IntoRecvData<TL>,
+    ) -> Result<TL::RecvReturn, Error> {
         // We only want to accept packets with seq_nums in the range:
         // `self.pre_recv_seq_num < seq_num <= self.pre_recv_seq_num + self.recv_window.len()`.
         // To check that range we compute `seq_num - (self.pre_recv_seq_num + 1)` and check
@@ -178,7 +216,7 @@ impl<App: ApplicationLayer> SeqQueue<App> {
         }
     }
 
-    fn take_send(&mut self, reply_num: SeqNum) -> Option<App::SendData> {
+    fn take_send(&mut self, reply_num: SeqNum) -> Option<TL::SendData> {
         let i = reply_num as usize % self.send_window.len();
         if self.send_window[i].as_ref().map_or(false, |e| e.seq_num == reply_num) {
             self.send_window[i].take().map(|e| e.data)
@@ -186,7 +224,7 @@ impl<App: ApplicationLayer> SeqQueue<App> {
             None
         }
     }
-    pub fn pump(&mut self, app: App) -> Result<App::RecvReturn, Error> {
+    pub fn pump(&mut self, app: TL) -> Result<TL::RecvReturn, Error> {
         let next_seq_num = self.pre_recv_seq_num.wrapping_add(1);
         let i = next_seq_num as usize % self.recv_window.len();
 
@@ -200,7 +238,7 @@ impl<App: ApplicationLayer> SeqQueue<App> {
             let data = entry.reply_num.and_then(|r| self.take_send(r));
             Ok(app.process(
                 ReplyGuard { app: Some(&app), seq_queue: self, reply_num: entry.seq_num },
-                App::deserialize(&entry.data),
+                TL::deserialize(&entry.data),
                 data,
             ))
         } else {
@@ -216,7 +254,7 @@ impl<App: ApplicationLayer> SeqQueue<App> {
             }
         }
     }
-    pub fn receive_empty_reply(&mut self, reply_num: SeqNum) -> Option<App::SendData> {
+    pub fn receive_empty_reply(&mut self, reply_num: SeqNum) -> Option<TL::SendData> {
         let i = reply_num as usize % self.send_window.len();
         if self.send_window[i].as_ref().map_or(false, |e| e.seq_num == reply_num) {
             let entry = self.send_window[i].take().unwrap();
@@ -226,7 +264,7 @@ impl<App: ApplicationLayer> SeqQueue<App> {
         }
     }
 
-    pub fn service(&mut self, app: App, current_time: i64) -> i64 {
+    pub fn service(&mut self, app: TL, current_time: i64) -> i64 {
         let next_interval = current_time + self.retry_interval;
         let mut next_activity = next_interval;
         for item in self.send_window.iter_mut() {
@@ -242,38 +280,38 @@ impl<App: ApplicationLayer> SeqQueue<App> {
         next_activity - current_time
     }
 
-    pub fn iter(&self) -> Iter<'_, App> {
+    pub fn iter(&self) -> Iter<'_, TL> {
         Iter(self.send_window.iter())
     }
-    pub fn iter_mut(&mut self) -> IterMut<'_, App> {
+    pub fn iter_mut(&mut self) -> IterMut<'_, TL> {
         IterMut(self.send_window.iter_mut())
     }
 }
-impl<'a, App: ApplicationLayer> IntoIterator for &'a SeqQueue<App> {
-    type Item = &'a App::SendData;
-    type IntoIter = Iter<'a, App>;
+impl<'a, TL: TransportLayer> IntoIterator for &'a SeqQueue<TL> {
+    type Item = &'a TL::SendData;
+    type IntoIter = Iter<'a, TL>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.iter()
     }
 }
-impl<'a, App: ApplicationLayer> IntoIterator for &'a mut SeqQueue<App> {
-    type Item = &'a mut App::SendData;
-    type IntoIter = IterMut<'a, App>;
+impl<'a, TL: TransportLayer> IntoIterator for &'a mut SeqQueue<TL> {
+    type Item = &'a mut TL::SendData;
+    type IntoIter = IterMut<'a, TL>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.iter_mut()
     }
 }
 
-impl<'a, App: ApplicationLayer> ReplyGuard<'a, App> {
+impl<'a, TL: TransportLayer> ReplyGuard<'a, TL> {
     pub fn seq_num(&self) -> SeqNum {
         self.seq_queue.next_send_seq_num
     }
     pub fn reply_num(&self) -> SeqNum {
         self.reply_num
     }
-    pub fn reply(mut self, packet_data: App::SendData, current_time: i64) {
+    pub fn reply(mut self, packet_data: TL::SendData, current_time: i64) {
         if let Some(app) = self.app {
             let seq_queue = &mut self.seq_queue;
             let seq_num = seq_queue.next_send_seq_num;
@@ -293,7 +331,7 @@ impl<'a, App: ApplicationLayer> ReplyGuard<'a, App> {
         }
     }
 }
-impl<'a, App: ApplicationLayer> Drop for ReplyGuard<'a, App> {
+impl<'a, TL: TransportLayer> Drop for ReplyGuard<'a, TL> {
     fn drop(&mut self) {
         if let Some(app) = self.app {
             app.send_empty_reply(self.reply_num);
@@ -303,8 +341,8 @@ impl<'a, App: ApplicationLayer> Drop for ReplyGuard<'a, App> {
 
 macro_rules! iterator {
     ($iter:ident, {$( $mut:tt )?}) => {
-        impl<'a, App: ApplicationLayer> Iterator for $iter<'a, App> {
-            type Item = &'a $($mut)? App::SendData;
+        impl<'a, TL: TransportLayer> Iterator for $iter<'a, TL> {
+            type Item = &'a $($mut)? TL::SendData;
             fn next(&mut self) -> Option<Self::Item> {
                 while let Some(entry) = self.0.next() {
                     if let Some(entry) = entry {
@@ -318,7 +356,7 @@ macro_rules! iterator {
                 (0, Some(self.0.len()))
             }
         }
-        impl<'a, App: ApplicationLayer> DoubleEndedIterator for $iter<'a, App> {
+        impl<'a, TL: TransportLayer> DoubleEndedIterator for $iter<'a, TL> {
             fn next_back(&mut self) -> Option<Self::Item> {
                 while let Some(entry) = self.0.next_back() {
                     if let Some(entry) = entry {

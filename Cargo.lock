@@ -3,5 +3,5 @@
 version = 3
 
 [[package]]
-name = "seq_queue"
+name = "seq_ex"
 version = "0.0.1"
