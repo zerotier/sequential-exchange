@@ -49,6 +49,11 @@ struct SendEntry<App: ApplicationLayer> {
     data: App::SendData,
 }
 
+pub enum Error {
+    OutOfSequence,
+    WindowIsFull,
+}
+
 /// Whenever a packet is received, it must be replied to.
 /// This Guard object guarantees that this is the case.
 /// If it is dropped without calling `reply` an empty reply will be sent to the remote peer.
@@ -81,7 +86,7 @@ impl<App: ApplicationLayer> SeqQueue<App> {
     #[must_use = "The queue might be full causing the packet to not be sent"]
     pub fn send_seq(&mut self, app: App, create: impl FnOnce(SeqNum) -> App::SendData, current_time: i64) -> bool {
         let seq_num = self.next_send_seq_num;
-        self.next_send_seq_num += 1;
+        self.next_send_seq_num = self.next_send_seq_num.wrapping_add(1);
 
         let i = seq_num as usize % self.send_window.len();
         if self.send_window[i].is_some() {
@@ -99,7 +104,7 @@ impl<App: ApplicationLayer> SeqQueue<App> {
         true
     }
 
-    pub fn receive(&mut self, app: App, seq_num: SeqNum, reply_num: Option<SeqNum>, packet: impl IntoRecvData<App>) -> Option<App::RecvReturn> {
+    pub fn receive(&mut self, app: App, seq_num: SeqNum, reply_num: Option<SeqNum>, packet: impl IntoRecvData<App>) -> Result<App::RecvReturn, Error> {
         let normalized_seq_num = seq_num.wrapping_sub(self.pre_recv_seq_num).wrapping_sub(1);
         let is_below_range = normalized_seq_num > SeqNum::MAX / 2;
         let is_above_range = !is_below_range && normalized_seq_num >= self.recv_window.len() as u32;
@@ -108,13 +113,16 @@ impl<App: ApplicationLayer> SeqQueue<App> {
             // Check whether or not we are already replying to this packet.
             for entry in self.send_window.iter() {
                 if entry.as_ref().map_or(false, |e| e.reply_num == Some(seq_num)) {
-                    return None;
+                    return Err(Error::OutOfSequence);
                 }
             }
             app.send_empty_reply(seq_num);
-            return None;
+            return Err(Error::OutOfSequence);
         } else if is_above_range {
-            return None;
+            return Err(Error::OutOfSequence);
+        }
+        if self.is_full() {
+            return Err(Error::WindowIsFull);
         }
         let i = seq_num as usize % self.recv_window.len();
         if let Some(pre) = self.recv_window[i].as_mut() {
@@ -123,24 +131,24 @@ impl<App: ApplicationLayer> SeqQueue<App> {
                     self.recv_window[i] = None;
                 } else {
                     app.send_ack(seq_num);
-                    return None;
+                    return Err(Error::OutOfSequence);
                 }
             } else {
-                return None;
+                return Err(Error::OutOfSequence);
             }
         }
         if is_next {
             // This should reliably handle sequence number overflow.
             self.pre_recv_seq_num = seq_num;
             let data = reply_num.and_then(|r| self.take_send(r));
-            Some(app.process(packet.as_ref(), ReplyGuard { app: Some(&app), seq_queue: self, reply_num: seq_num }, data))
+            Ok(app.process(packet.as_ref(), ReplyGuard { app: Some(&app), seq_queue: self, reply_num: seq_num }, data))
         } else {
             self.recv_window[i] = Some(RecvEntry { seq_num, reply_num, data: packet.into() });
             if let Some(reply_num) = reply_num {
                 self.receive_ack(reply_num);
             }
             app.send_ack(seq_num);
-            None
+            Err(Error::OutOfSequence)
         }
     }
 
@@ -152,21 +160,24 @@ impl<App: ApplicationLayer> SeqQueue<App> {
             None
         }
     }
-    pub fn pump(&mut self, app: App) -> Option<App::RecvReturn> {
+    pub fn pump(&mut self, app: App) -> Result<App::RecvReturn, Error> {
         let next_seq_num = self.pre_recv_seq_num.wrapping_add(1);
         let i = next_seq_num as usize % self.recv_window.len();
 
         if self.recv_window[i].as_ref().map_or(false, |pre| pre.seq_num == next_seq_num) {
+            if self.is_full() {
+                return Err(Error::WindowIsFull);
+            }
             self.pre_recv_seq_num = next_seq_num;
             let entry = self.recv_window[i].take().unwrap();
             let data = entry.reply_num.and_then(|r| self.take_send(r));
-            Some(app.process(
+            Ok(app.process(
                 App::deserialize(&entry.data),
                 ReplyGuard { app: Some(&app), seq_queue: self, reply_num: entry.seq_num },
                 data,
             ))
         } else {
-            None
+            Err(Error::OutOfSequence)
         }
     }
 
@@ -217,23 +228,13 @@ impl<'a, App: ApplicationLayer> ReplyGuard<'a, App> {
         let seq_queue = &self.seq_queue;
         seq_queue.send_window[seq_queue.next_send_seq_num as usize % seq_queue.send_window.len()].is_some()
     }
-    /// If the return value is `false` the queue is full and the packet will not be sent.
-    /// The caller must either cancel the reply or abort the connection.
-    /// If the reply is cancelled then the remote peer will receive an empty reply instead.
-    ///
-    /// A packet can only be replied to once. Once a call to `reply` is successful and returns `true`,
-    /// all subsequent calls will return `false`.
-    #[must_use = "The queue might be full causing the packet to not be sent"]
-    pub fn reply(&mut self, create: impl FnOnce(SeqNum, SeqNum) -> App::SendData, current_time: i64) -> bool {
+    pub fn reply(mut self, create: impl FnOnce(SeqNum, SeqNum) -> App::SendData, current_time: i64) {
         if let Some(app) = self.app {
             let seq_queue = &mut self.seq_queue;
             let seq_num = seq_queue.next_send_seq_num;
-            seq_queue.next_send_seq_num += 1;
+            seq_queue.next_send_seq_num = seq_queue.next_send_seq_num.wrapping_add(1);
 
             let i = seq_num as usize % seq_queue.send_window.len();
-            if seq_queue.send_window[i].is_some() {
-                return false;
-            }
             let next_resent_time = current_time + seq_queue.retry_interval;
             let entry = seq_queue.send_window[i].insert(SendEntry {
                 seq_num,
@@ -244,9 +245,6 @@ impl<'a, App: ApplicationLayer> ReplyGuard<'a, App> {
 
             app.send(&entry.data);
             self.app = None;
-            true
-        } else {
-            false
         }
     }
 }
