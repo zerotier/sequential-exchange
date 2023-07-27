@@ -55,6 +55,8 @@ pub trait TransportLayer: Sized {
 
     type SendData;
 
+    fn time(&self) -> i64;
+
     fn send(&self, data: &Self::SendData);
     fn send_ack(&self, reply_no: SeqNo);
     fn send_empty_reply(&self, reply_no: SeqNo);
@@ -194,14 +196,14 @@ impl<TL: TransportLayer> SeqEx<TL> {
     /// user would like. However this choice of units must be consistent with the units of the
     /// `retry_interval`. `current_time` does not have to be monotonically increasing.
     #[must_use = "The queue might be full causing the packet to not be sent"]
-    pub fn send(&mut self, app: TL, packet_data: TL::SendData, current_time: i64) -> bool {
+    pub fn send(&mut self, app: TL, packet_data: TL::SendData) -> bool {
         if self.is_full() {
             return false;
         }
         let seq_no = self.next_send_seq_no;
         self.next_send_seq_no = self.next_send_seq_no.wrapping_add(1);
 
-        let next_resent_time = current_time + self.resend_interval;
+        let next_resent_time = app.time() + self.resend_interval;
         let entry = self.send_window[seq_no as usize % self.send_window.len()].insert(SendEntry {
             seq_no,
             reply_no: None,
@@ -213,13 +215,7 @@ impl<TL: TransportLayer> SeqEx<TL> {
         true
     }
 
-    pub fn receive(
-        &mut self,
-        app: TL,
-        seq_no: SeqNo,
-        reply_no: Option<SeqNo>,
-        packet: impl IntoRecvData<TL>,
-    ) -> Result<TL::RecvReturn, Error> {
+    pub fn receive(&mut self, app: TL, seq_no: SeqNo, reply_no: Option<SeqNo>, packet: impl IntoRecvData<TL>) -> Result<TL::RecvReturn, Error> {
         // We only want to accept packets with seq_nos in the range:
         // `self.pre_recv_seq_no < seq_no <= self.pre_recv_seq_no + self.recv_window.len()`.
         // To check that range we compute `seq_no - (self.pre_recv_seq_no + 1)` and check
@@ -328,7 +324,8 @@ impl<TL: TransportLayer> SeqEx<TL> {
         }
     }
 
-    pub fn service(&mut self, app: TL, current_time: i64) -> i64 {
+    pub fn service(&mut self, app: TL) -> i64 {
+        let current_time = app.time();
         let next_interval = current_time + self.resend_interval;
         let mut next_activity = next_interval;
         for item in self.send_window.iter_mut() {
@@ -375,14 +372,14 @@ impl<'a, TL: TransportLayer> ReplyGuard<'a, TL> {
     pub fn reply_no(&self) -> SeqNo {
         self.reply_no
     }
-    pub fn reply(mut self, packet_data: TL::SendData, current_time: i64) {
+    pub fn reply(mut self, packet_data: TL::SendData) {
         if let Some(app) = self.app {
             let seq_queue = &mut self.seq_queue;
             let seq_no = seq_queue.next_send_seq_no;
             seq_queue.next_send_seq_no = seq_queue.next_send_seq_no.wrapping_add(1);
 
             let i = seq_no as usize % seq_queue.send_window.len();
-            let next_resent_time = current_time + seq_queue.resend_interval;
+            let next_resent_time = app.time() + seq_queue.resend_interval;
             let entry = seq_queue.send_window[i].insert(SendEntry {
                 seq_no,
                 reply_no: Some(self.reply_no),
@@ -393,6 +390,10 @@ impl<'a, TL: TransportLayer> ReplyGuard<'a, TL> {
             app.send(&entry.data);
             self.app = None;
         }
+    }
+    pub fn reply_with(self, creator: impl FnOnce(SeqNo, SeqNo) -> TL::SendData) {
+        let packet_data = creator(self.seq_no(), self.reply_no());
+        self.reply(packet_data)
     }
 }
 impl<'a, TL: TransportLayer> Drop for ReplyGuard<'a, TL> {
