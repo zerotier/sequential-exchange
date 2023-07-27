@@ -242,7 +242,13 @@ impl<'a, App: ApplicationLayer> IntoIterator for &'a mut SeqQueue<App> {
 }
 
 impl<'a, App: ApplicationLayer> ReplyGuard<'a, App> {
-    pub fn reply(mut self, create: impl FnOnce(SeqNum, SeqNum) -> App::SendData, current_time: i64) {
+    pub fn seq_num(&self) -> SeqNum {
+        self.seq_queue.next_send_seq_num
+    }
+    pub fn reply_num(&self) -> SeqNum {
+        self.reply_num
+    }
+    pub fn reply(mut self, packet: App::SendData, current_time: i64) {
         if let Some(app) = self.app {
             let seq_queue = &mut self.seq_queue;
             let seq_num = seq_queue.next_send_seq_num;
@@ -254,7 +260,7 @@ impl<'a, App: ApplicationLayer> ReplyGuard<'a, App> {
                 seq_num,
                 reply_num: Some(self.reply_num),
                 next_resent_time,
-                data: create(seq_num, self.reply_num),
+                data: packet,
             });
 
             app.send(&entry.data);
