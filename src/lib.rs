@@ -12,7 +12,7 @@ pub trait ApplicationLayer: Sized {
     fn send_empty_reply(&self, reply_num: SeqNum);
 
     fn deserialize<'a>(data: &'a Self::RecvData) -> Self::RecvDataRef<'a>;
-    fn process(&self, packet: Self::RecvDataRef<'_>, reply: ReplyGuard<'_, Self>, send_data: Option<Self::SendData>) -> Self::RecvReturn;
+    fn process(&self, reply_cx: ReplyGuard<'_, Self>, recv_packet: Self::RecvDataRef<'_>, send_data: Option<Self::SendData>) -> Self::RecvReturn;
 }
 
 pub trait IntoRecvData<App: ApplicationLayer>: Into<App::RecvData> {
@@ -143,7 +143,7 @@ impl<App: ApplicationLayer> SeqQueue<App> {
             // This should reliably handle sequence number overflow.
             self.pre_recv_seq_num = seq_num;
             let data = reply_num.and_then(|r| self.take_send(r));
-            Ok(app.process(packet.as_ref(), ReplyGuard { app: Some(&app), seq_queue: self, reply_num: seq_num }, data))
+            Ok(app.process(ReplyGuard { app: Some(&app), seq_queue: self, reply_num: seq_num }, packet.as_ref(), data))
         } else {
             self.recv_window[i] = Some(RecvEntry { seq_num, reply_num, data: packet.into() });
             if let Some(reply_num) = reply_num {
@@ -174,8 +174,8 @@ impl<App: ApplicationLayer> SeqQueue<App> {
             let entry = self.recv_window[i].take().unwrap();
             let data = entry.reply_num.and_then(|r| self.take_send(r));
             Ok(app.process(
-                App::deserialize(&entry.data),
                 ReplyGuard { app: Some(&app), seq_queue: self, reply_num: entry.seq_num },
+                App::deserialize(&entry.data),
                 data,
             ))
         } else {
