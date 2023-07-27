@@ -9,5 +9,3 @@ name = "seq_queue"
 path = "src/lib.rs"
 doc = true
 
-[dependencies]
-rand = "0.8.5"
