@@ -25,7 +25,7 @@
 //! A lot of this overhead owes to TCPs sizeable complexity.
 //!
 //! That being said SEP does lack many of TCP's additional features, such as a dynamic resend timer,
-//! keep-alives, and expiration handling. This can be both a pro and a con, as it means there is a
+//! keep-alives, and fragmentation. This can be both a pro and a con, as it means there is a
 //! lot of efficiency to be gained if these features are not needed or are implemented at a
 //! different protocol layer.
 //!
@@ -37,7 +37,7 @@
 #![forbid(unsafe_code)]
 //#![warn(missing_docs, missing_debug_implementations, rust_2018_idioms)]
 
-pub type SeqNum = u32;
+pub type SeqNo = u32;
 
 pub trait TransportLayer: Sized {
     type RecvData;
@@ -47,8 +47,8 @@ pub trait TransportLayer: Sized {
     type SendData;
 
     fn send(&self, data: &Self::SendData);
-    fn send_ack(&self, reply_num: SeqNum);
-    fn send_empty_reply(&self, reply_num: SeqNum);
+    fn send_ack(&self, reply_num: SeqNo);
+    fn send_empty_reply(&self, reply_num: SeqNo);
 
     fn deserialize<'a>(data: &'a Self::RecvData) -> Self::RecvDataRef<'a>;
     fn process(&self, reply_cx: ReplyGuard<'_, Self>, recv_packet: Self::RecvDataRef<'_>, send_data: Option<Self::SendData>) -> Self::RecvReturn;
@@ -65,21 +65,21 @@ impl<TL: TransportLayer> IntoRecvData<TL> for TL::RecvData {
 
 pub struct SeqEx<TL: TransportLayer, const SLEN: usize = 64, const RLEN: usize = 32> {
     pub retry_interval: i64,
-    next_send_seq_num: SeqNum,
-    pre_recv_seq_num: SeqNum,
+    next_send_seq_num: SeqNo,
+    pre_recv_seq_num: SeqNo,
     send_window: [Option<SendEntry<TL>>; SLEN],
     recv_window: [Option<RecvEntry<TL>>; RLEN],
 }
 
 struct RecvEntry<TL: TransportLayer> {
-    seq_num: SeqNum,
-    reply_num: Option<SeqNum>,
+    seq_num: SeqNo,
+    reply_num: Option<SeqNo>,
     data: TL::RecvData,
 }
 
 struct SendEntry<TL: TransportLayer> {
-    seq_num: SeqNum,
-    reply_num: Option<SeqNum>,
+    seq_num: SeqNo,
+    reply_num: Option<SeqNo>,
     next_resent_time: i64,
     data: TL::SendData,
 }
@@ -94,14 +94,14 @@ pub enum Error {
 pub struct ReplyGuard<'a, TL: TransportLayer> {
     app: Option<&'a TL>,
     seq_queue: &'a mut SeqEx<TL>,
-    reply_num: SeqNum,
+    reply_num: SeqNo,
 }
 
 pub struct Iter<'a, TL: TransportLayer>(core::slice::Iter<'a, Option<SendEntry<TL>>>);
 pub struct IterMut<'a, TL: TransportLayer>(core::slice::IterMut<'a, Option<SendEntry<TL>>>);
 
 impl<TL: TransportLayer> SeqEx<TL> {
-    pub fn new(retry_interval: i64, initial_seq_num: SeqNum) -> Self {
+    pub fn new(retry_interval: i64, initial_seq_num: SeqNo) -> Self {
         Self {
             retry_interval,
             next_send_seq_num: initial_seq_num,
@@ -118,7 +118,7 @@ impl<TL: TransportLayer> SeqEx<TL> {
         self.send_window[next_i % self.send_window.len()].is_some() || self.send_window[(next_i + 1) % self.send_window.len()].is_some()
     }
 
-    pub fn seq_num(&self) -> SeqNum {
+    pub fn seq_num(&self) -> SeqNo {
         self.next_send_seq_num
     }
     /// If the return value is `false` the queue is full and the packet will not be sent.
@@ -152,8 +152,8 @@ impl<TL: TransportLayer> SeqEx<TL> {
     pub fn receive(
         &mut self,
         app: TL,
-        seq_num: SeqNum,
-        reply_num: Option<SeqNum>,
+        seq_num: SeqNo,
+        reply_num: Option<SeqNo>,
         packet: impl IntoRecvData<TL>,
     ) -> Result<TL::RecvReturn, Error> {
         // We only want to accept packets with seq_nums in the range:
@@ -161,7 +161,7 @@ impl<TL: TransportLayer> SeqEx<TL> {
         // To check that range we compute `seq_num - (self.pre_recv_seq_num + 1)` and check
         // if the number wrapped below 0, or if it is above `self.recv_window.len()`.
         let normalized_seq_num = seq_num.wrapping_sub(self.pre_recv_seq_num).wrapping_sub(1);
-        let is_below_range = normalized_seq_num > SeqNum::MAX / 2;
+        let is_below_range = normalized_seq_num > SeqNo::MAX / 2;
         let is_above_range = !is_below_range && normalized_seq_num >= self.recv_window.len() as u32;
         let is_next = normalized_seq_num == 0;
         if is_below_range {
@@ -216,7 +216,7 @@ impl<TL: TransportLayer> SeqEx<TL> {
         }
     }
 
-    fn take_send(&mut self, reply_num: SeqNum) -> Option<TL::SendData> {
+    fn take_send(&mut self, reply_num: SeqNo) -> Option<TL::SendData> {
         let i = reply_num as usize % self.send_window.len();
         if self.send_window[i].as_ref().map_or(false, |e| e.seq_num == reply_num) {
             self.send_window[i].take().map(|e| e.data)
@@ -246,7 +246,7 @@ impl<TL: TransportLayer> SeqEx<TL> {
         }
     }
 
-    pub fn receive_ack(&mut self, reply_num: SeqNum) {
+    pub fn receive_ack(&mut self, reply_num: SeqNo) {
         let i = reply_num as usize % self.send_window.len();
         if let Some(entry) = self.send_window[i].as_mut() {
             if entry.seq_num == reply_num {
@@ -254,7 +254,7 @@ impl<TL: TransportLayer> SeqEx<TL> {
             }
         }
     }
-    pub fn receive_empty_reply(&mut self, reply_num: SeqNum) -> Option<TL::SendData> {
+    pub fn receive_empty_reply(&mut self, reply_num: SeqNo) -> Option<TL::SendData> {
         let i = reply_num as usize % self.send_window.len();
         if self.send_window[i].as_ref().map_or(false, |e| e.seq_num == reply_num) {
             let entry = self.send_window[i].take().unwrap();
@@ -305,10 +305,10 @@ impl<'a, TL: TransportLayer> IntoIterator for &'a mut SeqEx<TL> {
 }
 
 impl<'a, TL: TransportLayer> ReplyGuard<'a, TL> {
-    pub fn seq_num(&self) -> SeqNum {
+    pub fn seq_num(&self) -> SeqNo {
         self.seq_queue.next_send_seq_num
     }
-    pub fn reply_num(&self) -> SeqNum {
+    pub fn reply_num(&self) -> SeqNo {
         self.reply_num
     }
     pub fn reply(mut self, packet_data: TL::SendData, current_time: i64) {

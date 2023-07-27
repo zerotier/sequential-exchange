@@ -27,7 +27,7 @@ features that slow down runtime regardless of whether or not they are used.
 A lot of this overhead owes to TCPs sizeable complexity.
 
 That being said SEP does lack many of TCP's additional features, such as a dynamic resend timer,
-keep-alives, and expiration handling. This can be both a pro and a con, as it means there is a
+keep-alives, and fragmentation. This can be both a pro and a con, as it means there is a
 lot of efficiency to be gained if these features are not needed or are implemented at a
 different protocol layer.
 
