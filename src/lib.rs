@@ -1,3 +1,4 @@
 pub type SeqNum = u32;
 
-pub mod seq_queue;
+mod seq_queue;
+pub use seq_queue::*;

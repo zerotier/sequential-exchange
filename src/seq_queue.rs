@@ -1,9 +1,5 @@
 use crate::SeqNum;
 
-const INITIAL_SEQ_NUM: SeqNum = 1;
-const SEQ_RECV_WINDOW_LEN: usize = 32;
-const SEQ_SEND_WINDOW_LEN: usize = 64;
-
 pub trait ApplicationLayer: Sized {
     type RecvData;
     type RecvDataRef<'a>;
@@ -28,12 +24,12 @@ impl<AppInner: ApplicationLayer> IntoRecvData<AppInner> for AppInner::RecvData {
     }
 }
 
-pub struct SeqQueue<App: ApplicationLayer> {
+pub struct SeqQueue<App: ApplicationLayer, const SLEN: usize = 64, const RLEN: usize = 32> {
     pub retry_interval: i64,
     next_send_seq_num: SeqNum,
     pre_recv_seq_num: SeqNum,
-    recv_window: [Option<RecvEntry<App>>; SEQ_RECV_WINDOW_LEN],
-    send_window: [Option<SendEntry<App>>; SEQ_SEND_WINDOW_LEN],
+    send_window: [Option<SendEntry<App>>; SLEN],
+    recv_window: [Option<RecvEntry<App>>; RLEN],
 }
 
 struct RecvEntry<App: ApplicationLayer> {
@@ -51,7 +47,7 @@ struct SendEntry<App: ApplicationLayer> {
 
 pub enum Error {
     OutOfSequence,
-    WindowIsFull,
+    QueueIsFull,
 }
 
 /// Whenever a packet is received, it must be replied to.
@@ -67,11 +63,11 @@ pub struct Iter<'a, App: ApplicationLayer>(std::slice::Iter<'a, Option<SendEntry
 pub struct IterMut<'a, App: ApplicationLayer>(std::slice::IterMut<'a, Option<SendEntry<App>>>);
 
 impl<App: ApplicationLayer> SeqQueue<App> {
-    pub fn new(retry_interval: i64) -> Self {
+    pub fn new(retry_interval: i64, initial_seq_num: SeqNum) -> Self {
         Self {
             retry_interval,
-            next_send_seq_num: INITIAL_SEQ_NUM,
-            pre_recv_seq_num: INITIAL_SEQ_NUM - 1,
+            next_send_seq_num: initial_seq_num,
+            pre_recv_seq_num: initial_seq_num.wrapping_sub(1),
             recv_window: std::array::from_fn(|_| None),
             send_window: std::array::from_fn(|_| None),
         }
@@ -122,7 +118,7 @@ impl<App: ApplicationLayer> SeqQueue<App> {
             return Err(Error::OutOfSequence);
         }
         if self.is_full() {
-            return Err(Error::WindowIsFull);
+            return Err(Error::QueueIsFull);
         }
         let i = seq_num as usize % self.recv_window.len();
         if let Some(pre) = self.recv_window[i].as_mut() {
@@ -166,7 +162,7 @@ impl<App: ApplicationLayer> SeqQueue<App> {
 
         if self.recv_window[i].as_ref().map_or(false, |pre| pre.seq_num == next_seq_num) {
             if self.is_full() {
-                return Err(Error::WindowIsFull);
+                return Err(Error::QueueIsFull);
             }
             self.pre_recv_seq_num = next_seq_num;
             let entry = self.recv_window[i].take().unwrap();
@@ -215,11 +211,27 @@ impl<App: ApplicationLayer> SeqQueue<App> {
         next_activity - current_time
     }
 
-    pub fn window_iter(&self) -> Iter<'_, App> {
+    pub fn iter(&self) -> Iter<'_, App> {
         Iter(self.send_window.iter())
     }
-    pub fn window_iter_mut(&mut self) -> IterMut<'_, App> {
+    pub fn iter_mut(&mut self) -> IterMut<'_, App> {
         IterMut(self.send_window.iter_mut())
+    }
+}
+impl<'a, App: ApplicationLayer> IntoIterator for &'a SeqQueue<App> {
+    type Item = &'a App::SendData;
+    type IntoIter = Iter<'a, App>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+impl<'a, App: ApplicationLayer> IntoIterator for &'a mut SeqQueue<App> {
+    type Item = &'a mut App::SendData;
+    type IntoIter = IterMut<'a, App>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter_mut()
     }
 }
 
@@ -248,7 +260,6 @@ impl<'a, App: ApplicationLayer> ReplyGuard<'a, App> {
         }
     }
 }
-
 impl<'a, App: ApplicationLayer> Drop for ReplyGuard<'a, App> {
     fn drop(&mut self) {
         if let Some(app) = self.app {
