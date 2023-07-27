@@ -13,7 +13,7 @@
 //!
 //! SEP is a tiny, dead simple protocol and we have implemented it here in less than 500 lines of code.
 //!
-//! # Why not TCP?
+//! ## Why not TCP?
 //!
 //! TCP only guarantees packets will be received in the same order they were sent.
 //! It has no inherent concept of "replying to a packet" and as such it cannot guarantee both sides
@@ -31,7 +31,7 @@
 //!
 //! Neither SEP nor TCP are cryptographically secure.
 //!
-//! # Examples
+//! ## Examples
 //!
 #![no_std]
 #![forbid(unsafe_code)]
@@ -63,7 +63,7 @@ impl<TL: TransportLayer> IntoRecvData<TL> for TL::RecvData {
     }
 }
 
-pub struct SeqQueue<TL: TransportLayer, const SLEN: usize = 64, const RLEN: usize = 32> {
+pub struct SeqEx<TL: TransportLayer, const SLEN: usize = 64, const RLEN: usize = 32> {
     pub retry_interval: i64,
     next_send_seq_num: SeqNum,
     pre_recv_seq_num: SeqNum,
@@ -93,14 +93,14 @@ pub enum Error {
 /// If it is dropped without calling `reply` an empty reply will be sent to the remote peer.
 pub struct ReplyGuard<'a, TL: TransportLayer> {
     app: Option<&'a TL>,
-    seq_queue: &'a mut SeqQueue<TL>,
+    seq_queue: &'a mut SeqEx<TL>,
     reply_num: SeqNum,
 }
 
 pub struct Iter<'a, TL: TransportLayer>(core::slice::Iter<'a, Option<SendEntry<TL>>>);
 pub struct IterMut<'a, TL: TransportLayer>(core::slice::IterMut<'a, Option<SendEntry<TL>>>);
 
-impl<TL: TransportLayer> SeqQueue<TL> {
+impl<TL: TransportLayer> SeqEx<TL> {
     pub fn new(retry_interval: i64, initial_seq_num: SeqNum) -> Self {
         Self {
             retry_interval,
@@ -287,7 +287,7 @@ impl<TL: TransportLayer> SeqQueue<TL> {
         IterMut(self.send_window.iter_mut())
     }
 }
-impl<'a, TL: TransportLayer> IntoIterator for &'a SeqQueue<TL> {
+impl<'a, TL: TransportLayer> IntoIterator for &'a SeqEx<TL> {
     type Item = &'a TL::SendData;
     type IntoIter = Iter<'a, TL>;
 
@@ -295,7 +295,7 @@ impl<'a, TL: TransportLayer> IntoIterator for &'a SeqQueue<TL> {
         self.iter()
     }
 }
-impl<'a, TL: TransportLayer> IntoIterator for &'a mut SeqQueue<TL> {
+impl<'a, TL: TransportLayer> IntoIterator for &'a mut SeqEx<TL> {
     type Item = &'a mut TL::SendData;
     type IntoIter = IterMut<'a, TL>;
 
