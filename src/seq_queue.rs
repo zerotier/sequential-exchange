@@ -1,4 +1,3 @@
-
 use crate::SeqNum;
 
 const INITIAL_SEQ_NUM: SeqNum = 1;
@@ -17,12 +16,7 @@ pub trait ApplicationLayer: Sized {
     fn send_empty_reply(&self, reply_num: SeqNum);
 
     fn deserialize<'a>(data: &'a Self::RecvData) -> Self::RecvDataRef<'a>;
-    fn process(
-        &self,
-        packet: Self::RecvDataRef<'_>,
-        reply: ReplyGuard<'_, Self>,
-        send_data: Option<Self::SendData>,
-    ) -> Self::RecvReturn;
+    fn process(&self, packet: Self::RecvDataRef<'_>, reply: ReplyGuard<'_, Self>, send_data: Option<Self::SendData>) -> Self::RecvReturn;
 }
 
 pub trait IntoRecvData<App: ApplicationLayer>: Into<App::RecvData> {
@@ -33,7 +27,6 @@ impl<AppInner: ApplicationLayer> IntoRecvData<AppInner> for AppInner::RecvData {
         AppInner::deserialize(self)
     }
 }
-
 
 pub struct SeqQueue<App: ApplicationLayer> {
     pub retry_interval: i64,
@@ -65,6 +58,9 @@ pub struct ReplyGuard<'a, App: ApplicationLayer> {
     reply_num: SeqNum,
 }
 
+pub struct Iter<'a, App: ApplicationLayer>(std::slice::Iter<'a, Option<SendEntry<App>>>);
+pub struct IterMut<'a, App: ApplicationLayer>(std::slice::IterMut<'a, Option<SendEntry<App>>>);
+
 impl<App: ApplicationLayer> SeqQueue<App> {
     pub fn new(retry_interval: i64) -> Self {
         Self {
@@ -83,12 +79,7 @@ impl<App: ApplicationLayer> SeqQueue<App> {
     /// The caller must either cancel sending, abort the connection, or wait until a call to
     /// `receive` returns `Some` and try again.
     #[must_use = "The queue might be full causing the packet to not be sent"]
-    pub fn send_seq(
-        &mut self,
-        app: App,
-        create: impl FnOnce(SeqNum) -> App::SendData,
-        current_time: i64,
-    ) -> bool {
+    pub fn send_seq(&mut self, app: App, create: impl FnOnce(SeqNum) -> App::SendData, current_time: i64) -> bool {
         let seq_num = self.next_send_seq_num;
         self.next_send_seq_num += 1;
 
@@ -108,13 +99,7 @@ impl<App: ApplicationLayer> SeqQueue<App> {
         true
     }
 
-    pub fn receive(
-        &mut self,
-        app: App,
-        seq_num: SeqNum,
-        reply_num: Option<SeqNum>,
-        packet: impl IntoRecvData<App>,
-    ) -> Option<App::RecvReturn> {
+    pub fn receive(&mut self, app: App, seq_num: SeqNum, reply_num: Option<SeqNum>, packet: impl IntoRecvData<App>) -> Option<App::RecvReturn> {
         let normalized_seq_num = seq_num.wrapping_sub(self.pre_recv_seq_num).wrapping_sub(1);
         let is_below_range = normalized_seq_num > SeqNum::MAX / 2;
         let is_above_range = !is_below_range && normalized_seq_num >= self.recv_window.len() as u32;
@@ -148,17 +133,9 @@ impl<App: ApplicationLayer> SeqQueue<App> {
             // This should reliably handle sequence number overflow.
             self.pre_recv_seq_num = seq_num;
             let data = reply_num.and_then(|r| self.take_send(r));
-            Some(app.process(
-                packet.as_ref(),
-                ReplyGuard { app: Some(&app), seq_queue: self, reply_num: seq_num },
-                data,
-            ))
+            Some(app.process(packet.as_ref(), ReplyGuard { app: Some(&app), seq_queue: self, reply_num: seq_num }, data))
         } else {
-            self.recv_window[i] = Some(RecvEntry {
-                seq_num,
-                reply_num,
-                data: packet.into(),
-            });
+            self.recv_window[i] = Some(RecvEntry { seq_num, reply_num, data: packet.into() });
             if let Some(reply_num) = reply_num {
                 self.receive_ack(reply_num);
             }
@@ -234,41 +211,6 @@ impl<App: ApplicationLayer> SeqQueue<App> {
         IterMut(self.send_window.iter_mut())
     }
 }
-macro_rules! iterator {
-    ($iter:ident, {$( $mut:tt )?}) => {
-        impl<'a, App: ApplicationLayer> Iterator for $iter<'a, App> {
-            type Item = &'a $($mut)? App::SendData;
-            fn next(&mut self) -> Option<Self::Item> {
-                while let Some(entry) = self.0.next() {
-                    if let Some(entry) = entry {
-                        return Some(& $($mut)? entry.data)
-                    }
-                }
-                None
-            }
-
-            fn size_hint(&self) -> (usize, Option<usize>) {
-                (0, Some(self.0.len()))
-            }
-        }
-        impl<'a, App: ApplicationLayer> DoubleEndedIterator for $iter<'a, App> {
-            fn next_back(&mut self) -> Option<Self::Item> {
-                while let Some(entry) = self.0.next_back() {
-                    if let Some(entry) = entry {
-                        return Some(& $($mut)? entry.data)
-                    }
-                }
-                None
-            }
-        }
-    }
-}
-
-pub struct Iter<'a, App: ApplicationLayer> (std::slice::Iter<'a, Option<SendEntry<App>>>);
-pub struct IterMut<'a, App: ApplicationLayer> (std::slice::IterMut<'a, Option<SendEntry<App>>>);
-
-iterator!(Iter, { });
-iterator!(IterMut, {mut});
 
 impl<'a, App: ApplicationLayer> ReplyGuard<'a, App> {
     pub fn is_full(&self) -> bool {
@@ -282,11 +224,7 @@ impl<'a, App: ApplicationLayer> ReplyGuard<'a, App> {
     /// A packet can only be replied to once. Once a call to `reply` is successful and returns `true`,
     /// all subsequent calls will return `false`.
     #[must_use = "The queue might be full causing the packet to not be sent"]
-    pub fn reply(
-        &mut self,
-        create: impl FnOnce(SeqNum, SeqNum) -> App::SendData,
-        current_time: i64,
-    ) -> bool {
+    pub fn reply(&mut self, create: impl FnOnce(SeqNum, SeqNum) -> App::SendData, current_time: i64) -> bool {
         if let Some(app) = self.app {
             let seq_queue = &mut self.seq_queue;
             let seq_num = seq_queue.next_send_seq_num;
@@ -320,3 +258,35 @@ impl<'a, App: ApplicationLayer> Drop for ReplyGuard<'a, App> {
         }
     }
 }
+
+macro_rules! iterator {
+    ($iter:ident, {$( $mut:tt )?}) => {
+        impl<'a, App: ApplicationLayer> Iterator for $iter<'a, App> {
+            type Item = &'a $($mut)? App::SendData;
+            fn next(&mut self) -> Option<Self::Item> {
+                while let Some(entry) = self.0.next() {
+                    if let Some(entry) = entry {
+                        return Some(& $($mut)? entry.data)
+                    }
+                }
+                None
+            }
+
+            fn size_hint(&self) -> (usize, Option<usize>) {
+                (0, Some(self.0.len()))
+            }
+        }
+        impl<'a, App: ApplicationLayer> DoubleEndedIterator for $iter<'a, App> {
+            fn next_back(&mut self) -> Option<Self::Item> {
+                while let Some(entry) = self.0.next_back() {
+                    if let Some(entry) = entry {
+                        return Some(& $($mut)? entry.data)
+                    }
+                }
+                None
+            }
+        }
+    }
+}
+iterator!(Iter, {});
+iterator!(IterMut, {mut});
