@@ -31,7 +31,7 @@ fn drop_packet() -> bool {
     *rng ^= *rng << 13;
     *rng ^= *rng >> 17;
     *rng ^= *rng << 5;
-    *rng & 1 > 0
+    *rng & 3 == 0
 }
 
 struct Transport {
@@ -119,7 +119,7 @@ fn main() {
     assert!(seq1.send(&transport1, RawPacket::Send(seq1.seq_no(), SendPacket::Mod(5.0))));
     value %= 5.0;
 
-    for _ in 0..20 {
+    for _ in 0..30 {
         receive(&recv1, &mut seq1, &transport1);
         receive(&recv2, &mut seq2, &transport2);
         thread::sleep(Duration::from_millis(5));
