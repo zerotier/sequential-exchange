@@ -1,0 +1,13 @@
+[package]
+name = "seq_queue"
+version = "0.0.1"
+authors = ["Monica Moniot"]
+edition = "2021"
+
+[lib]
+name = "seq_queue"
+path = "src/lib.rs"
+doc = true
+
+[dependencies]
+rand = "0.8.5"
