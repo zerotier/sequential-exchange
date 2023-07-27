@@ -100,7 +100,13 @@ impl<App: ApplicationLayer> SeqQueue<App> {
         true
     }
 
-    pub fn receive(&mut self, app: App, seq_num: SeqNum, reply_num: Option<SeqNum>, packet: impl IntoRecvData<App>) -> Result<App::RecvReturn, Error> {
+    pub fn receive(
+        &mut self,
+        app: App,
+        seq_num: SeqNum,
+        reply_num: Option<SeqNum>,
+        packet: impl IntoRecvData<App>,
+    ) -> Result<App::RecvReturn, Error> {
         let normalized_seq_num = seq_num.wrapping_sub(self.pre_recv_seq_num).wrapping_sub(1);
         let is_below_range = normalized_seq_num > SeqNum::MAX / 2;
         let is_above_range = !is_below_range && normalized_seq_num >= self.recv_window.len() as u32;
