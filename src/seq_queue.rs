@@ -33,32 +33,15 @@
 //!
 //! ## Examples
 //!
-#![forbid(unsafe_code)]
-//#![warn(missing_docs, rust_2018_idioms)]
-const MAX_CONCURRENCY: usize = 24;
+
+use crate::TransportLayer;
 
 /// A 32-bit sequence number. Packets transported with SEP are expected to contain at least one
 /// sequence number, and sometimes two.
 /// All packets will either have a seq_no, a reply_no, or both.
 pub type SeqNo = u32;
 
-/// A trait for giving an instance of SeqEx access to the transport layer.
-///
-/// The implementor is free to choose how to define the generic types based on how they want to
-/// manage memory.
-/// It is possible through these generics to implement SeqEx to be no-alloc and zero-copy, but otherwise
-/// a lot of them are most easily implemented as tuples of custom enums and Vec<u8>.
-pub trait TransportLayer: Sized + Clone {
-    type RecvData;
-    type SendData;
-
-    fn time(&self) -> i64;
-
-    fn send(&self, data: &Self::SendData);
-    fn send_ack(&self, reply_no: SeqNo);
-    fn send_empty_reply(&self, reply_no: SeqNo);
-}
-
+const MAX_CONCURRENCY: usize = 24;
 pub struct SeqEx<TL: TransportLayer, const SLEN: usize = 64, const RLEN: usize = 32> {
     /// The interval at which packets will be resent if they have not yet been acknowledged by the
     /// remote peer.
@@ -187,7 +170,7 @@ impl<TL: TransportLayer> SeqEx<TL> {
         true
     }
 
-    pub fn receive<P: Into<TL::RecvData>>(
+    pub fn receive_raw<P: Into<TL::RecvData>>(
         &mut self,
         app: TL,
         seq_no: SeqNo,
@@ -287,7 +270,7 @@ impl<TL: TransportLayer> SeqEx<TL> {
             None
         }
     }
-    pub fn pump(&mut self) -> Result<(SeqNo, TL::RecvData, Option<TL::SendData>), Error> {
+    pub fn pump_raw(&mut self) -> Result<(SeqNo, TL::RecvData, Option<TL::SendData>), Error> {
         let next_seq_no = self.pre_recv_seq_no.wrapping_add(1);
         let i = next_seq_no as usize % self.recv_window.len();
 
@@ -324,7 +307,7 @@ impl<TL: TransportLayer> SeqEx<TL> {
         next_activity - current_time
     }
 
-    pub fn reply(&mut self, app: TL, reply_no: SeqNo, packet_data: TL::SendData) {
+    pub fn reply_raw(&mut self, app: TL, reply_no: SeqNo, packet_data: TL::SendData) {
         if self.remove_reservation(reply_no) {
             let seq_no = self.next_send_seq_no;
             self.next_send_seq_no = self.next_send_seq_no.wrapping_add(1);
@@ -341,7 +324,7 @@ impl<TL: TransportLayer> SeqEx<TL> {
             app.send(&entry.data);
         }
     }
-    pub fn reply_empty(&mut self, app: TL, reply_no: SeqNo) {
+    pub fn reply_empty_raw(&mut self, app: TL, reply_no: SeqNo) {
         if self.remove_reservation(reply_no) {
             app.send_empty_reply(reply_no);
         }
