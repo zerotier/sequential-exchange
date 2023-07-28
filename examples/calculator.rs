@@ -3,7 +3,8 @@ use std::{
         mpsc::{channel, Receiver, Sender},
         Mutex,
     },
-    time::Duration, thread,
+    thread,
+    time::Duration,
 };
 
 use seq_ex::{ReplyGuard, SeqEx, SeqNo};
@@ -91,11 +92,9 @@ fn receive<'a>(recv: &Receiver<RawPacket>, seq: &mut SeqEx<&'a Transport>, trans
             while let Ok(()) = seq.pump(transport) {}
         }
         Ok(RawPacket::Send(seq_no, packet)) => match seq.receive(transport, seq_no, None, packet) {
-            Ok(()) => {
-                while let Ok(()) = seq.pump(transport) {}
-            }
+            Ok(()) => while let Ok(()) = seq.pump(transport) {},
             Err(_) => {}
-        }
+        },
         _ => {}
     }
 }
