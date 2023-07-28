@@ -3,32 +3,29 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use seq_ex::{ReplyGuard, SeqEx, SeqNo};
 use std::time::Instant;
 
-#[derive(Clone)]
-enum RawPacket {
+#[derive(Clone, Debug)]
+enum Packet {
     Ack(SeqNo),
     EmptyReply(SeqNo),
-    Send(SeqNo, Packet),
-    Reply(SeqNo, SeqNo, Packet),
+    Hello(SeqNo),
+    Reply(SeqNo, SeqNo, ReplyPacket),
 }
-#[derive(Clone)]
-enum Packet {
-    Hello,
+
+#[derive(Clone, Debug)]
+enum ReplyPacket {
     Space,
     World,
     Exclamation,
 }
 
 struct Transport {
-    channel: Sender<RawPacket>,
+    channel: Sender<Packet>,
     time: Instant,
 }
 
 impl seq_ex::TransportLayer for &Transport {
     type RecvData = Packet;
-    type RecvDataRef<'a> = &'a Packet;
-    type RecvReturn = ();
-
-    type SendData = RawPacket;
+    type SendData = Packet;
 
     fn time(&self) -> i64 {
         self.time.elapsed().as_millis() as i64
@@ -38,47 +35,75 @@ impl seq_ex::TransportLayer for &Transport {
         let _ = self.channel.send(data.clone());
     }
     fn send_ack(&self, reply_no: SeqNo) {
-        let _ = self.channel.send(RawPacket::Ack(reply_no));
+        let _ = self.channel.send(Packet::Ack(reply_no));
     }
     fn send_empty_reply(&self, reply_no: SeqNo) {
-        let _ = self.channel.send(RawPacket::EmptyReply(reply_no));
+        let _ = self.channel.send(Packet::EmptyReply(reply_no));
     }
+}
 
-    fn deserialize<'a>(data: &'a Self::RecvData) -> Self::RecvDataRef<'a> {
-        data
-    }
-    fn process(&self, reply_cx: ReplyGuard<'_, Self>, recv_packet: &Packet, _: Option<Self::SendData>) -> Self::RecvReturn {
-        use RawPacket::Reply;
-        match recv_packet {
-            Packet::Hello => {
-                print!("Hello");
-                reply_cx.reply_with(|seq_no, reply_no| Reply(seq_no, reply_no, Packet::Space));
-            }
-            Packet::Space => {
+fn process(guard: ReplyGuard<'_, &Transport>, recv_packet: Packet, send_packet: Option<Packet>) {
+    use Packet::*;
+    use ReplyPacket::*;
+    match (recv_packet, send_packet) {
+        (Hello(_), None) => {
+            print!("Hello");
+            guard.reply_with(|seq_no, reply_no| Reply(seq_no, reply_no, Space));
+        }
+        (Reply(_, _, r), Some(p)) => match (r, p) {
+            (Space, Hello(_)) => {
                 print!(" ");
-                reply_cx.reply_with(|seq_no, reply_no| Reply(seq_no, reply_no, Packet::World));
+                guard.reply_with(|seq_no, reply_no| Reply(seq_no, reply_no, World));
             }
-            Packet::World => {
+            (World, Reply(_, _, Space)) => {
                 print!("World");
-                reply_cx.reply_with(|seq_no, reply_no| Reply(seq_no, reply_no, Packet::Exclamation));
+                guard.reply_with(|seq_no, reply_no| Reply(seq_no, reply_no, Exclamation));
             }
-            Packet::Exclamation => {
+            (Exclamation, Reply(_, _, World)) => {
                 println!("!");
             }
+            (a, b) => {
+                println!("Unsolicited reply received: {:?}, was a reply to: {:?}", a, b);
+            }
+        },
+        (a, None) => {
+            println!("Unsolicited packet received: {:?}", a);
+        }
+        (a, Some(b)) => {
+            println!("Unsolicited reply received: {:?}, was a reply to: {:?}", a, b);
         }
     }
 }
 
-fn receive<'a>(recv: &Receiver<RawPacket>, seq: &mut SeqEx<&'a Transport>, transport: &'a Transport) {
-    match recv.recv().unwrap() {
-        RawPacket::Ack(reply_no) => seq.receive_ack(reply_no),
-        RawPacket::EmptyReply(reply_no) => {
-            seq.receive_empty_reply(reply_no);
+fn receive<'a>(recv: &Receiver<Packet>, seq: &mut SeqEx<&'a Transport>, transport: &'a Transport) {
+    use Packet::*;
+    let do_pump = {
+        let result = match recv.recv().unwrap() {
+            Ack(reply_no) => {
+                seq.receive_ack(reply_no);
+                return;
+            }
+            EmptyReply(reply_no) => {
+                seq.receive_empty_reply(reply_no);
+                return;
+            }
+            Hello(seq_no) => seq.receive(transport, seq_no, None, Hello(seq_no)),
+            Reply(seq_no, reply_no, p) => seq.receive(transport, seq_no, Some(reply_no), Reply(seq_no, reply_no, p)),
+        };
+        if let Ok((guard, recv_packet, send_packet)) = result {
+            process(guard, recv_packet, send_packet);
+            true
+        } else {
+            false
         }
-        RawPacket::Send(seq_no, packet) => seq.receive(transport, seq_no, None, packet).unwrap(),
-        RawPacket::Reply(seq_no, reply_no, packet) => seq.receive(transport, seq_no, Some(reply_no), packet).unwrap(),
+    };
+    if do_pump {
+        while let Ok((guard, recv_packet, send_packet)) = seq.pump(transport) {
+            process(guard, recv_packet, send_packet);
+        }
     }
 }
+
 fn main() {
     let (send1, recv1) = channel();
     let (send2, recv2) = channel();
@@ -87,7 +112,7 @@ fn main() {
     let mut seq1 = SeqEx::new(100, 1);
     let mut seq2 = SeqEx::new(100, 1);
 
-    assert!(seq1.send(&transport1, RawPacket::Send(seq1.seq_no(), Packet::Hello)));
+    assert!(seq1.send_with(&transport1, |seq_no| Packet::Hello(seq_no)));
 
     receive(&recv2, &mut seq2, &transport2);
     receive(&recv1, &mut seq1, &transport1);

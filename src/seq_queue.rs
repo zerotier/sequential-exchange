@@ -169,6 +169,11 @@ impl<TL: TransportLayer> SeqEx<TL> {
         app.send(&entry.data);
         true
     }
+    #[must_use = "The queue might be full causing the packet to not be sent"]
+    pub fn send_with(&mut self, app: TL, create_data: impl FnOnce(SeqNo) -> TL::SendData) -> bool {
+        let p = create_data(self.seq_no());
+        self.send(app, p)
+    }
 
     pub fn receive_raw<P: Into<TL::RecvData>>(
         &mut self,

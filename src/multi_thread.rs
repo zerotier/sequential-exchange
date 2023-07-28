@@ -6,7 +6,7 @@ pub struct SeqExLock<TL: TransportLayer>(pub Mutex<SeqEx<TL>>);
 
 pub struct ReplyGuard<'a, TL: TransportLayer>(&'a SeqExLock<TL>, TL, SeqNo);
 impl<'a, TL: TransportLayer> ReplyGuard<'a, TL> {
-    pub fn reply(self, packet_data: impl FnOnce(SeqNo, SeqNo) -> TL::SendData) {
+    pub fn reply_with(self, packet_data: impl FnOnce(SeqNo, SeqNo) -> TL::SendData) {
         let mut seq = self.0 .0.lock().unwrap();
         let p = packet_data(seq.seq_no(), self.2);
         seq.reply_raw(self.1.clone(), self.2, p);
