@@ -211,15 +211,15 @@ impl<TL: TransportLayer> SeqEx<TL> {
         // because there would be no way to reply.
         // We can only process this packet if processing it would make space in the send window.
         let next_i = self.next_send_seq_no as usize % self.send_window.len();
-        let would_be_full = self.send_window[next_i].as_ref().map_or(false, |e| Some(e.seq_no) != reply_no);
+        let is_full = self.send_window[next_i].as_ref().map_or(false, |e| Some(e.seq_no) != reply_no) || self.reserved_len >= self.reserved.len();
         let i = seq_no as usize % self.recv_window.len();
         if let Some(pre) = self.recv_window[i].as_mut() {
             if seq_no == pre.seq_no {
-                if is_next && !would_be_full {
+                if is_next && !is_full {
                     self.recv_window[i] = None;
                 } else {
                     app.send_ack(seq_no);
-                    return if would_be_full {
+                    return if is_full {
                         Err(Error::WindowIsFull)
                     } else {
                         Err(Error::OutOfSequence)
@@ -230,7 +230,7 @@ impl<TL: TransportLayer> SeqEx<TL> {
                 return Err(Error::OutOfSequence);
             }
         }
-        if is_next && !would_be_full {
+        if is_next && !is_full {
             self.pre_recv_seq_no = seq_no;
             self.reserved[self.reserved_len] = seq_no;
             self.reserved_len += 1;
@@ -242,7 +242,7 @@ impl<TL: TransportLayer> SeqEx<TL> {
                 self.receive_ack(reply_no);
             }
             app.send_ack(seq_no);
-            if would_be_full {
+            if is_full {
                 Err(Error::WindowIsFull)
             } else {
                 Err(Error::OutOfSequence)
@@ -281,7 +281,7 @@ impl<TL: TransportLayer> SeqEx<TL> {
 
         if self.recv_window[i].as_ref().map_or(false, |pre| pre.seq_no == next_seq_no) {
             let next_i = self.next_send_seq_no as usize % self.send_window.len();
-            if self.send_window[next_i].is_some() {
+            if self.send_window[next_i].is_some() || self.reserved_len >= self.reserved.len() {
                 return Err(Error::WindowIsFull);
             }
             let entry = self.recv_window[i].take().unwrap();
