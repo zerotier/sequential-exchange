@@ -12,10 +12,6 @@ impl<'a, TL: TransportLayer> ReplyGuard<'a, TL> {
         self.0.reply_raw(self.1.clone(), self.2, packet_data);
         core::mem::forget(self);
     }
-    pub fn reply_with(self, create_data: impl FnOnce(SeqNo, SeqNo) -> TL::SendData) {
-        let p = create_data(self.seq_no(), self.reply_no());
-        self.reply(p)
-    }
 }
 impl<'a, TL: TransportLayer> Drop for ReplyGuard<'a, TL> {
     fn drop(&mut self) {

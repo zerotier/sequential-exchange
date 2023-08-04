@@ -11,4 +11,4 @@ mod single_thread;
 pub use single_thread::*;
 
 #[cfg(feature = "std")]
-pub mod multi_thread;
+pub mod sync;

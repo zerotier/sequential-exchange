@@ -4,15 +4,15 @@ use crate::SeqNo;
 ///
 /// The implementor is free to choose how to define the generic types based on how they want to
 /// manage memory.
-/// It is possible through these generics to implement SeqEx to be no-alloc and zero-copy, but otherwise
-/// a lot of them are most easily implemented as tuples of custom enums and Vec<u8>.
+/// It is possible through these generics to make SeqEx no-alloc and zero-copy, but otherwise
+/// they are most easily implemented as some combination of custom enums, `Vec<u8>` and `Arc<[u8]>`.
 pub trait TransportLayer: Sized + Clone {
     type RecvData;
     type SendData;
 
     fn time(&self) -> i64;
 
-    fn send(&self, data: &Self::SendData);
+    fn send(&self, seq_no: SeqNo, reply_no: Option<SeqNo>, payload: &Self::SendData);
     fn send_ack(&self, reply_no: SeqNo);
     fn send_empty_reply(&self, reply_no: SeqNo);
 }

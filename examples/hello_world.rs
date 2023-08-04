@@ -1,94 +1,58 @@
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::Receiver;
 
-use seq_ex::{ReplyGuard, SeqEx, SeqNo};
-use std::time::Instant;
+use seq_ex::sync::{MpscTransport, PacketType};
+use seq_ex::{ReplyGuard, SeqEx};
 
 #[derive(Clone, Debug)]
 enum Packet {
-    Ack(SeqNo),
-    EmptyReply(SeqNo),
-    Hello(SeqNo),
-    Reply(SeqNo, SeqNo, ReplyPacket),
-}
-
-#[derive(Clone, Debug)]
-enum ReplyPacket {
+    Hello,
     Space,
     World,
     Exclamation,
 }
+use Packet::*;
 
-struct Transport {
-    channel: Sender<Packet>,
-    time: Instant,
-}
-
-impl seq_ex::TransportLayer for &Transport {
-    type RecvData = Packet;
-    type SendData = Packet;
-
-    fn time(&self) -> i64 {
-        self.time.elapsed().as_millis() as i64
-    }
-
-    fn send(&self, data: &Self::SendData) {
-        let _ = self.channel.send(data.clone());
-    }
-    fn send_ack(&self, reply_no: SeqNo) {
-        let _ = self.channel.send(Packet::Ack(reply_no));
-    }
-    fn send_empty_reply(&self, reply_no: SeqNo) {
-        let _ = self.channel.send(Packet::EmptyReply(reply_no));
-    }
-}
-
-fn process(guard: ReplyGuard<'_, &Transport>, recv_packet: Packet, send_packet: Option<Packet>) {
-    use Packet::*;
-    use ReplyPacket::*;
+fn process(guard: ReplyGuard<'_, &MpscTransport<Packet>>, recv_packet: Packet, send_packet: Option<Packet>) {
     match (recv_packet, send_packet) {
-        (Hello(_), None) => {
+        (Hello, None) => {
             print!("Hello");
-            guard.reply_with(|seq_no, reply_no| Reply(seq_no, reply_no, Space));
+            guard.reply(Space);
         }
-        (Reply(_, _, r), Some(p)) => match (r, p) {
-            (Space, Hello(_)) => {
-                print!(" ");
-                guard.reply_with(|seq_no, reply_no| Reply(seq_no, reply_no, World));
-            }
-            (World, Reply(_, _, Space)) => {
-                print!("World");
-                guard.reply_with(|seq_no, reply_no| Reply(seq_no, reply_no, Exclamation));
-            }
-            (Exclamation, Reply(_, _, World)) => {
-                println!("!");
-            }
-            (a, b) => {
-                println!("Unsolicited reply received: {:?}, was a reply to: {:?}", a, b);
-            }
-        },
+        (Space, Some(Hello)) => {
+            print!(" ");
+            guard.reply(World);
+        }
+        (World, Some(Space)) => {
+            print!("World");
+            guard.reply(Exclamation);
+        }
+        (Exclamation, Some(World)) => {
+            print!("!");
+        }
         (a, None) => {
-            println!("Unsolicited packet received: {:?}", a);
+            print!("Unsolicited packet received: {:?}", a);
         }
         (a, Some(b)) => {
-            println!("Unsolicited reply received: {:?}, was a reply to: {:?}", a, b);
+            print!("Incorrect reply received: {:?}, was a reply to: {:?}", a, b);
         }
     }
 }
 
-fn receive<'a>(recv: &Receiver<Packet>, seq: &mut SeqEx<&'a Transport>, transport: &'a Transport) {
-    use Packet::*;
+fn receive<'a>(recv: &Receiver<PacketType<Packet>>, seq: &mut SeqEx<&'a MpscTransport<Packet>>, transport: &'a MpscTransport<Packet>) {
     let do_pump = {
         let result = match recv.recv().unwrap() {
-            Ack(reply_no) => {
+            PacketType::Ack { reply_no } => {
                 seq.receive_ack(reply_no);
                 return;
             }
-            EmptyReply(reply_no) => {
-                seq.receive_empty_reply(reply_no);
+            PacketType::EmptyReply { reply_no } => {
+                if let Some(Exclamation) = seq.receive_empty_reply(reply_no) {
+                    // Our Hello World exchange ends right here.
+                    print!("\n");
+                }
                 return;
             }
-            Hello(seq_no) => seq.receive(transport, seq_no, None, Hello(seq_no)),
-            Reply(seq_no, reply_no, p) => seq.receive(transport, seq_no, Some(reply_no), Reply(seq_no, reply_no, p)),
+            PacketType::Data { seq_no, reply_no, payload } => seq.receive(transport, seq_no, reply_no, payload),
         };
         if let Ok((guard, recv_packet, send_packet)) = result {
             process(guard, recv_packet, send_packet);
@@ -105,17 +69,17 @@ fn receive<'a>(recv: &Receiver<Packet>, seq: &mut SeqEx<&'a Transport>, transpor
 }
 
 fn main() {
-    let (send1, recv1) = channel();
-    let (send2, recv2) = channel();
-    let transport1 = Transport { channel: send2, time: Instant::now() };
-    let transport2 = Transport { channel: send1, time: Instant::now() };
-    let mut seq1 = SeqEx::new(100, 1);
-    let mut seq2 = SeqEx::new(100, 1);
+    let (transport1, recv2) = MpscTransport::new();
+    let (transport2, recv1) = MpscTransport::new();
+    let mut seq1 = SeqEx::default();
+    let mut seq2 = SeqEx::default();
 
-    assert!(seq1.send_with(&transport1, |seq_no| Packet::Hello(seq_no)));
+    // We begin a "Hello World" exchange right here.
+    assert!(seq1.try_send(&transport1, Packet::Hello).is_ok());
 
     receive(&recv2, &mut seq2, &transport2);
     receive(&recv1, &mut seq1, &transport1);
     receive(&recv2, &mut seq2, &transport2);
     receive(&recv1, &mut seq1, &transport1);
+    receive(&recv2, &mut seq2, &transport2);
 }

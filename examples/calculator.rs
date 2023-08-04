@@ -43,8 +43,6 @@ struct Transport {
 
 impl seq_ex::TransportLayer for &Transport {
     type RecvData = SendPacket;
-    type RecvDataRef<'a> = &'a SendPacket;
-    type RecvReturn = ();
 
     type SendData = RawPacket;
 
@@ -67,20 +65,16 @@ impl seq_ex::TransportLayer for &Transport {
             let _ = self.channel.send(RawPacket::EmptyReply(reply_no));
         }
     }
-
-    fn deserialize<'a>(data: &'a Self::RecvData) -> Self::RecvDataRef<'a> {
-        data
-    }
-    fn process(&self, _: ReplyGuard<'_, Self>, recv_packet: &SendPacket, _: Option<Self::SendData>) -> Self::RecvReturn {
-        let mut value = self.value.lock().unwrap();
-        use SendPacket::*;
-        match recv_packet {
-            Add(n) => *value = *value + n,
-            Sub(n) => *value = *value - n,
-            Mul(n) => *value = *value * n,
-            Div(n) => *value = *value / n,
-            Mod(n) => *value = *value % n,
-        }
+}
+fn process(&self, _: ReplyGuard<'_, Self>, recv_packet: &SendPacket, _: Option<Self::SendData>) -> Self::RecvReturn {
+    let mut value = self.value.lock().unwrap();
+    use SendPacket::*;
+    match recv_packet {
+        Add(n) => *value = *value + n,
+        Sub(n) => *value = *value - n,
+        Mul(n) => *value = *value * n,
+        Div(n) => *value = *value / n,
+        Mod(n) => *value = *value % n,
     }
 }
 
@@ -107,15 +101,15 @@ fn main() {
     let mut seq2 = SeqEx::new(5, 1);
 
     let mut value = 0.0;
-    assert!(seq1.send(&transport1, RawPacket::Send(seq1.seq_no(), SendPacket::Add(1.0))));
+    assert!(seq1.try_send(&transport1, RawPacket::Send(seq1.seq_no(), SendPacket::Add(1.0))));
     value += 1.0;
-    assert!(seq1.send(&transport1, RawPacket::Send(seq1.seq_no(), SendPacket::Sub(2.0))));
+    assert!(seq1.try_send(&transport1, RawPacket::Send(seq1.seq_no(), SendPacket::Sub(2.0))));
     value -= 2.0;
-    assert!(seq1.send(&transport1, RawPacket::Send(seq1.seq_no(), SendPacket::Mul(3.0))));
+    assert!(seq1.try_send(&transport1, RawPacket::Send(seq1.seq_no(), SendPacket::Mul(3.0))));
     value *= 3.0;
-    assert!(seq1.send(&transport1, RawPacket::Send(seq1.seq_no(), SendPacket::Div(4.0))));
+    assert!(seq1.try_send(&transport1, RawPacket::Send(seq1.seq_no(), SendPacket::Div(4.0))));
     value /= 4.0;
-    assert!(seq1.send(&transport1, RawPacket::Send(seq1.seq_no(), SendPacket::Mod(5.0))));
+    assert!(seq1.try_send(&transport1, RawPacket::Send(seq1.seq_no(), SendPacket::Mod(5.0))));
     value %= 5.0;
 
     for _ in 0..30 {

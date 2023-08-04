@@ -41,6 +41,11 @@ use crate::TransportLayer;
 /// All packets will either have a seq_no, a reply_no, or both.
 pub type SeqNo = u32;
 
+/// The resend interval for a default instance of SeqEx.
+pub const DEFAULT_RESEND_INTERVAL_MS: i64 = 200;
+/// The initial sequence number for a default instance of SeqEx.
+pub const DEFAULT_INITIAL_SEQ_NO: SeqNo = 1;
+
 const MAX_CONCURRENCY: usize = 24;
 pub struct SeqEx<TL: TransportLayer, const SLEN: usize = 64, const RLEN: usize = 32> {
     /// The interval at which packets will be resent if they have not yet been acknowledged by the
@@ -151,9 +156,9 @@ impl<TL: TransportLayer> SeqEx<TL> {
     /// user would like. However this choice of units must be consistent with the units of the
     /// `retry_interval`. `current_time` does not have to be monotonically increasing.
     #[must_use = "The queue might be full causing the packet to not be sent"]
-    pub fn send(&mut self, app: TL, packet_data: TL::SendData) -> bool {
+    pub fn try_send(&mut self, app: TL, packet_data: TL::SendData) -> Result<(), TL::SendData> {
         if self.is_full() {
-            return false;
+            return Err(packet_data);
         }
         let seq_no = self.next_send_seq_no;
         self.next_send_seq_no = self.next_send_seq_no.wrapping_add(1);
@@ -166,13 +171,8 @@ impl<TL: TransportLayer> SeqEx<TL> {
             data: packet_data,
         });
 
-        app.send(&entry.data);
-        true
-    }
-    #[must_use = "The queue might be full causing the packet to not be sent"]
-    pub fn send_with(&mut self, app: TL, create_data: impl FnOnce(SeqNo) -> TL::SendData) -> bool {
-        let p = create_data(self.seq_no());
-        self.send(app, p)
+        app.send(entry.seq_no, entry.reply_no, &entry.data);
+        Ok(())
     }
 
     pub fn receive_raw<P: Into<TL::RecvData>>(
@@ -303,7 +303,7 @@ impl<TL: TransportLayer> SeqEx<TL> {
             if let Some(entry) = item {
                 if entry.next_resent_time <= current_time {
                     entry.next_resent_time = next_interval;
-                    app.send(&entry.data);
+                    app.send(entry.seq_no, entry.reply_no, &entry.data);
                 } else {
                     next_activity = next_activity.min(entry.next_resent_time);
                 }
@@ -326,7 +326,7 @@ impl<TL: TransportLayer> SeqEx<TL> {
                 data: packet_data,
             });
 
-            app.send(&entry.data);
+            app.send(entry.seq_no, entry.reply_no, &entry.data);
         }
     }
     pub fn reply_empty_raw(&mut self, app: TL, reply_no: SeqNo) {
@@ -350,6 +350,11 @@ impl<TL: TransportLayer> SeqEx<TL> {
     }
     pub fn iter_mut(&mut self) -> IterMut<'_, TL> {
         IterMut(self.send_window.iter_mut())
+    }
+}
+impl<TL: TransportLayer> Default for SeqEx<TL> {
+    fn default() -> Self {
+        Self::new(DEFAULT_RESEND_INTERVAL_MS, DEFAULT_INITIAL_SEQ_NO)
     }
 }
 impl<'a, TL: TransportLayer> IntoIterator for &'a SeqEx<TL> {
