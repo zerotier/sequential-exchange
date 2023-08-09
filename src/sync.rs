@@ -8,10 +8,12 @@ use std::{
     time::Instant,
 };
 
-use crate::{Error, SeqEx, SeqNo, TransportLayer};
+use crate::{
+    Error, SeqEx, SeqNo, TransportLayer, DEFAULT_INITIAL_SEQ_NO, DEFAULT_RECV_WINDOW_LEN, DEFAULT_RESEND_INTERVAL_MS, DEFAULT_SEND_WINDOW_LEN,
+};
 
-pub struct SeqExSync<TL: TransportLayer> {
-    seq_ex: Mutex<SeqEx<TL>>,
+pub struct SeqExSync<TL: TransportLayer, const SLEN: usize = DEFAULT_SEND_WINDOW_LEN, const RLEN: usize = DEFAULT_RECV_WINDOW_LEN> {
+    seq_ex: Mutex<SeqEx<TL, SLEN, RLEN>>,
     /// The mutex above is always held when this value changes, hence it is safe to mutate.
     /// We don't pack this as a component of the mutex to avoid having to reimplement MutexGuard.
     wait_count: UnsafeCell<usize>,
@@ -34,7 +36,15 @@ impl<'a, TL: TransportLayer> Drop for ReplyGuard<'a, TL> {
 }
 
 impl<TL: TransportLayer> SeqExSync<TL> {
-    pub fn receive<P: Into<TL::RecvData>, T>(
+    pub fn new(retry_interval: i64, initial_seq_no: SeqNo) -> Self {
+        Self {
+            seq_ex: Mutex::new(SeqEx::new(retry_interval, initial_seq_no)),
+            wait_count: UnsafeCell::new(0),
+            send_block: Condvar::default(),
+        }
+    }
+
+    pub fn receive<P: Into<TL::RecvData>>(
         &self,
         app: TL,
         seq_no: SeqNo,
@@ -54,19 +64,9 @@ impl<TL: TransportLayer> SeqExSync<TL> {
     }
     #[inline]
     fn unblock(&self, is_ok: bool) {
-        let has_waiting = unsafe {
-            *self.wait_count.get() > 0
-        };
+        let has_waiting = unsafe { *self.wait_count.get() > 0 };
         if has_waiting && is_ok {
             self.send_block.notify_one();
-        }
-    }
-
-    pub fn new(retry_interval: i64, initial_seq_no: SeqNo) -> Self {
-        Self {
-            seq_ex: Mutex::new(SeqEx::new(retry_interval, initial_seq_no)),
-            wait_count: UnsafeCell::new(0),
-            send_block: Condvar::default(),
         }
     }
     pub fn try_send(&self, app: TL, packet_data: TL::SendData) -> Result<(), TL::SendData> {
@@ -77,9 +77,9 @@ impl<TL: TransportLayer> SeqExSync<TL> {
         let mut seq = self.lock();
         while let Err(p) = seq.try_send(app.clone(), packet_data) {
             packet_data = p;
-            unsafe { *self.wait_count.get() += 1}
+            unsafe { *self.wait_count.get() += 1 }
             seq = self.send_block.wait(seq).unwrap();
-            unsafe { *self.wait_count.get() -= 1}
+            unsafe { *self.wait_count.get() -= 1 }
         }
     }
 
@@ -99,6 +99,11 @@ impl<TL: TransportLayer> SeqExSync<TL> {
 
     pub fn lock(&self) -> MutexGuard<SeqEx<TL>> {
         self.seq_ex.lock().unwrap()
+    }
+}
+impl<TL: TransportLayer> Default for SeqExSync<TL> {
+    fn default() -> Self {
+        Self::new(DEFAULT_RESEND_INTERVAL_MS, DEFAULT_INITIAL_SEQ_NO)
     }
 }
 
@@ -139,7 +144,7 @@ impl<Payload: Clone> TransportLayer for &MpscTransport<Payload> {
         self.time.elapsed().as_millis() as i64
     }
 
-    fn send(&self, seq_no: SeqNo, reply_no: Option<SeqNo>, payload: &Self::SendData) {
+    fn send(&self, seq_no: SeqNo, reply_no: Option<SeqNo>, payload: &Payload) {
         let _ = self.channel.send(PacketType::Data { seq_no, reply_no, payload: payload.clone() });
     }
     fn send_ack(&self, reply_no: SeqNo) {

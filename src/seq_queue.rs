@@ -46,8 +46,11 @@ pub const DEFAULT_RESEND_INTERVAL_MS: i64 = 200;
 /// The initial sequence number for a default instance of SeqEx.
 pub const DEFAULT_INITIAL_SEQ_NO: SeqNo = 1;
 
+pub const DEFAULT_SEND_WINDOW_LEN: usize = 64;
+pub const DEFAULT_RECV_WINDOW_LEN: usize = 32;
+
 const MAX_CONCURRENCY: usize = 24;
-pub struct SeqEx<TL: TransportLayer, const SLEN: usize = 64, const RLEN: usize = 32> {
+pub struct SeqEx<TL: TransportLayer, const SLEN: usize = DEFAULT_SEND_WINDOW_LEN, const RLEN: usize = DEFAULT_RECV_WINDOW_LEN> {
     /// The interval at which packets will be resent if they have not yet been acknowledged by the
     /// remote peer.
     /// It can be statically or dynamically set, it is up to the user to decide.
@@ -141,11 +144,11 @@ impl<TL: TransportLayer> SeqEx<TL> {
     }
     /// Sends the given packet to the remote peer and adds it to the send window.
     ///
-    /// If the return value is `false` the queue is full and the packet will not be sent.
+    /// If the return value is `Err` the queue is full and the packet will not be sent.
     /// The caller must either cancel sending, abort the connection, or wait until a call to
-    /// `receive` or `receive_empty_reply` returns `Some` and try again.
+    /// `receive` or `receive_empty_reply` returns `Ok` and try again.
     ///
-    /// If true is returned then the packet was successfully sent.
+    /// If `Ok` is returned then the packet was successfully sent.
     ///
     /// `packet_data` should contain both the packet to be sent as well as any local metadata the
     /// caller wants to store with the packet. This metadata allows the exchange to be stateful.

@@ -1,7 +1,6 @@
 use std::sync::mpsc::Receiver;
 
-use seq_ex::sync::{MpscTransport, PacketType};
-use seq_ex::{ReplyGuard, SeqEx};
+use seq_ex::sync::{MpscTransport, PacketType, ReplyGuard, SeqExSync};
 
 #[derive(Clone, Debug)]
 enum Packet {
@@ -38,27 +37,27 @@ fn process(guard: ReplyGuard<'_, &MpscTransport<Packet>>, recv_packet: Packet, s
     }
 }
 
-fn receive<'a>(recv: &Receiver<PacketType<Packet>>, seq: &mut SeqEx<&'a MpscTransport<Packet>>, transport: &'a MpscTransport<Packet>) {
-    let do_pump = {
-        let result = match recv.recv().unwrap() {
-            PacketType::Ack { reply_no } => {
-                seq.receive_ack(reply_no);
-                return;
+fn receive<'a>(recv: &Receiver<PacketType<Packet>>, seq: &SeqExSync<&'a MpscTransport<Packet>>, transport: &'a MpscTransport<Packet>) {
+    let do_pump = match recv.recv().unwrap() {
+        PacketType::Ack { reply_no } => {
+            seq.receive_ack(reply_no);
+            return;
+        }
+        PacketType::EmptyReply { reply_no } => {
+            let result = seq.receive_empty_reply(reply_no);
+            if let Some(Exclamation) = result {
+                // Our Hello World exchange ends right here.
+                print!("\n");
             }
-            PacketType::EmptyReply { reply_no } => {
-                if let Some(Exclamation) = seq.receive_empty_reply(reply_no) {
-                    // Our Hello World exchange ends right here.
-                    print!("\n");
-                }
-                return;
+            result.is_some()
+        }
+        PacketType::Data { seq_no, reply_no, payload } => {
+            if let Ok((guard, recv_packet, send_packet)) = seq.receive(transport, seq_no, reply_no, payload) {
+                process(guard, recv_packet, send_packet);
+                true
+            } else {
+                false
             }
-            PacketType::Data { seq_no, reply_no, payload } => seq.receive(transport, seq_no, reply_no, payload),
-        };
-        if let Ok((guard, recv_packet, send_packet)) = result {
-            process(guard, recv_packet, send_packet);
-            true
-        } else {
-            false
         }
     };
     if do_pump {
@@ -71,15 +70,15 @@ fn receive<'a>(recv: &Receiver<PacketType<Packet>>, seq: &mut SeqEx<&'a MpscTran
 fn main() {
     let (transport1, recv2) = MpscTransport::new();
     let (transport2, recv1) = MpscTransport::new();
-    let mut seq1 = SeqEx::default();
-    let mut seq2 = SeqEx::default();
+    let seq1 = SeqExSync::default();
+    let seq2 = SeqExSync::default();
 
     // We begin a "Hello World" exchange right here.
-    assert!(seq1.try_send(&transport1, Packet::Hello).is_ok());
+    seq1.send(&transport1, Packet::Hello);
 
-    receive(&recv2, &mut seq2, &transport2);
-    receive(&recv1, &mut seq1, &transport1);
-    receive(&recv2, &mut seq2, &transport2);
-    receive(&recv1, &mut seq1, &transport1);
-    receive(&recv2, &mut seq2, &transport2);
+    receive(&recv2, &seq2, &transport2);
+    receive(&recv1, &seq1, &transport1);
+    receive(&recv2, &seq2, &transport2);
+    receive(&recv1, &seq1, &transport1);
+    receive(&recv2, &seq2, &transport2);
 }
