@@ -22,6 +22,11 @@ pub struct SeqExSync<TL: TransportLayer, const SLEN: usize = DEFAULT_SEND_WINDOW
 
 pub struct ReplyGuard<'a, TL: TransportLayer>(&'a SeqExSync<TL>, TL, SeqNo);
 impl<'a, TL: TransportLayer> ReplyGuard<'a, TL> {
+    /// If you need to reply more than once, say to fragment a large file, then include in your
+    /// first reply some identifier, and then `send` all fragments with the same included identifier.
+    /// The identifier will tell the remote peer which packets contain fragments of the file,
+    /// and since each fragment will be received in order it will be trivial for them to reconstruct
+    /// the original file.
     pub fn reply(self, packet_data: TL::SendData) {
         let mut seq = self.0.seq_ex.lock().unwrap();
         seq.reply_raw(self.1.clone(), self.2, packet_data);

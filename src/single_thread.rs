@@ -2,12 +2,11 @@ use crate::{Error, SeqEx, SeqNo, TransportLayer};
 
 pub struct ReplyGuard<'a, TL: TransportLayer>(&'a mut SeqEx<TL>, TL, SeqNo);
 impl<'a, TL: TransportLayer> ReplyGuard<'a, TL> {
-    pub fn seq_no(&self) -> SeqNo {
-        self.0.seq_no()
-    }
-    pub fn reply_no(&self) -> SeqNo {
-        self.2
-    }
+    /// If you need to reply more than once, say to fragment a large file, then include in your
+    /// first reply some identifier, and then `send` all fragments with the same included identifier.
+    /// The identifier will tell the remote peer which packets contain fragments of the file,
+    /// and since each fragment will be received in order it will be trivial for them to reconstruct
+    /// the original file.
     pub fn reply(self, packet_data: TL::SendData) {
         self.0.reply_raw(self.1.clone(), self.2, packet_data);
         core::mem::forget(self);
