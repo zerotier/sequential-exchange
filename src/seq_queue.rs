@@ -55,6 +55,7 @@ pub struct SeqEx<TL: TransportLayer, const SLEN: usize = DEFAULT_SEND_WINDOW_LEN
     /// remote peer.
     /// It can be statically or dynamically set, it is up to the user to decide.
     pub resend_interval: i64,
+    pub next_service_timestamp: i64,
     next_send_seq_no: SeqNo,
     pre_recv_seq_no: SeqNo,
     send_window: [Option<SendEntry<TL>>; SLEN],
@@ -72,7 +73,7 @@ struct RecvEntry<TL: TransportLayer> {
 struct SendEntry<TL: TransportLayer> {
     seq_no: SeqNo,
     reply_no: Option<SeqNo>,
-    next_resent_time: i64,
+    next_resend_time: i64,
     data: TL::SendData,
 }
 
@@ -116,6 +117,7 @@ impl<TL: TransportLayer> SeqEx<TL> {
     pub fn new(retry_interval: i64, initial_seq_no: SeqNo) -> Self {
         Self {
             resend_interval: retry_interval,
+            next_service_timestamp: i64::MIN,
             next_send_seq_no: initial_seq_no,
             pre_recv_seq_no: initial_seq_no.wrapping_sub(1),
             recv_window: core::array::from_fn(|_| None),
@@ -159,18 +161,25 @@ impl<TL: TransportLayer> SeqEx<TL> {
     /// user would like. However this choice of units must be consistent with the units of the
     /// `retry_interval`. `current_time` does not have to be monotonically increasing.
     #[must_use = "The queue might be full causing the packet to not be sent"]
-    pub fn try_send(&mut self, app: TL, packet_data: TL::SendData) -> Result<(), TL::SendData> {
+    pub fn try_send(&mut self, mut app: TL, packet_data: TL::SendData) -> Result<(), TL::SendData> {
         if self.is_full() {
             return Err(packet_data);
         }
         let seq_no = self.next_send_seq_no;
         self.next_send_seq_no = self.next_send_seq_no.wrapping_add(1);
 
-        let next_resent_time = app.time() + self.resend_interval;
-        let entry = self.send_window[seq_no as usize % self.send_window.len()].insert(SendEntry {
+        let current_time = app.time();
+        let next_resend_time = current_time + self.resend_interval;
+        if self.next_service_timestamp > next_resend_time {
+            self.next_service_timestamp = next_resend_time;
+            app.update_service_time(current_time, next_resend_time);
+        }
+        let i = seq_no as usize % self.send_window.len();
+        debug_assert!(self.send_window[i].is_none());
+        let entry = self.send_window[i].insert(SendEntry {
             seq_no,
             reply_no: None,
-            next_resent_time,
+            next_resend_time,
             data: packet_data,
         });
 
@@ -180,7 +189,7 @@ impl<TL: TransportLayer> SeqEx<TL> {
 
     pub fn receive_raw<P: Into<TL::RecvData>>(
         &mut self,
-        app: TL,
+        mut app: TL,
         seq_no: SeqNo,
         reply_no: Option<SeqNo>,
         packet: P,
@@ -256,7 +265,7 @@ impl<TL: TransportLayer> SeqEx<TL> {
         let i = reply_no as usize % self.send_window.len();
         if let Some(entry) = self.send_window[i].as_mut() {
             if entry.seq_no == reply_no {
-                entry.next_resent_time = i64::MAX;
+                entry.next_resend_time = i64::MAX;
             }
         }
     }
@@ -298,41 +307,30 @@ impl<TL: TransportLayer> SeqEx<TL> {
         }
     }
 
-    pub fn service(&mut self, app: TL) -> i64 {
-        let current_time = app.time();
-        let next_interval = current_time + self.resend_interval;
-        let mut next_activity = next_interval;
-        for item in self.send_window.iter_mut() {
-            if let Some(entry) = item {
-                if entry.next_resent_time <= current_time {
-                    entry.next_resent_time = next_interval;
-                    app.send(entry.seq_no, entry.reply_no, &entry.data);
-                } else {
-                    next_activity = next_activity.min(entry.next_resent_time);
-                }
-            }
-        }
-        next_activity - current_time
-    }
-
-    pub fn reply_raw(&mut self, app: TL, reply_no: SeqNo, packet_data: TL::SendData) {
+    pub fn reply_raw(&mut self, mut app: TL, reply_no: SeqNo, packet_data: TL::SendData) {
         if self.remove_reservation(reply_no) {
             let seq_no = self.next_send_seq_no;
             self.next_send_seq_no = self.next_send_seq_no.wrapping_add(1);
 
             let i = seq_no as usize % self.send_window.len();
-            let next_resent_time = app.time() + self.resend_interval;
+            let current_time = app.time();
+            let next_resend_time = current_time + self.resend_interval;
+            if self.next_service_timestamp > next_resend_time {
+                self.next_service_timestamp = next_resend_time;
+                app.update_service_time(current_time, next_resend_time);
+            }
+            debug_assert!(self.send_window[i].is_none());
             let entry = self.send_window[i].insert(SendEntry {
                 seq_no,
                 reply_no: Some(reply_no),
-                next_resent_time,
+                next_resend_time,
                 data: packet_data,
             });
 
             app.send(entry.seq_no, entry.reply_no, &entry.data);
         }
     }
-    pub fn reply_empty_raw(&mut self, app: TL, reply_no: SeqNo) {
+    pub fn reply_empty_raw(&mut self, mut app: TL, reply_no: SeqNo) {
         if self.remove_reservation(reply_no) {
             app.send_empty_reply(reply_no);
         }
@@ -346,6 +344,23 @@ impl<TL: TransportLayer> SeqEx<TL> {
             }
         }
         false
+    }
+
+    pub fn service(&mut self, mut app: TL) -> i64 {
+        let current_time = app.time();
+        let next_interval = current_time + self.resend_interval;
+        let mut next_activity = i64::MAX;
+        for entry in self.send_window.iter_mut().flatten() {
+            if entry.next_resend_time <= current_time {
+                entry.next_resend_time = next_interval;
+                app.send(entry.seq_no, entry.reply_no, &entry.data);
+            } else {
+                next_activity = next_activity.min(entry.next_resend_time);
+            }
+        }
+        self.next_service_timestamp = next_activity;
+        app.update_service_time(current_time, next_activity);
+        self.resend_interval.min(next_activity - current_time)
     }
 
     pub fn iter(&self) -> Iter<'_, TL> {

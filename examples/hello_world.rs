@@ -1,6 +1,6 @@
 use std::sync::mpsc::Receiver;
 
-use seq_ex::sync::{MpscTransport, PacketType, ReplyGuard, SeqExSync};
+use seq_ex::sync::{MpscTransport, PacketType, RecvSuccess, ReplyGuard, SeqExSync};
 
 #[derive(Clone, Debug)]
 enum Packet {
@@ -45,15 +45,15 @@ fn receive<'a>(recv: &Receiver<PacketType<Packet>>, seq: &SeqExSync<&'a MpscTran
         }
         PacketType::EmptyReply { reply_no } => {
             let result = seq.receive_empty_reply(reply_no);
-            if let Some(Exclamation) = result {
+            if let Some(Exclamation) = &result {
                 // Our Hello World exchange ends right here.
                 print!("\n");
             }
             result.is_some()
         }
-        PacketType::Data { seq_no, reply_no, payload } => {
-            if let Ok((guard, recv_packet, send_packet)) = seq.receive(transport, seq_no, reply_no, payload) {
-                process(guard, recv_packet, send_packet);
+        PacketType::Payload { seq_no, reply_no, payload } => {
+            if let Ok(RecvSuccess { guard, packet, send_data }) = seq.receive(transport, seq_no, reply_no, payload) {
+                process(guard, packet, send_data);
                 true
             } else {
                 false
@@ -61,8 +61,8 @@ fn receive<'a>(recv: &Receiver<PacketType<Packet>>, seq: &SeqExSync<&'a MpscTran
         }
     };
     if do_pump {
-        while let Ok((guard, recv_packet, send_packet)) = seq.pump(transport) {
-            process(guard, recv_packet, send_packet);
+        while let Ok(RecvSuccess { guard, packet, send_data }) = seq.pump(transport) {
+            process(guard, packet, send_data);
         }
     }
 }

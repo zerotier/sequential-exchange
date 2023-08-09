@@ -19,6 +19,12 @@ impl<'a, TL: TransportLayer> Drop for ReplyGuard<'a, TL> {
     }
 }
 
+pub struct RecvSuccess<'a, TL: TransportLayer, P> {
+    pub guard: ReplyGuard<'a, TL>,
+    pub packet: P,
+    pub send_data: Option<TL::SendData>,
+}
+
 impl<TL: TransportLayer> SeqEx<TL> {
     pub fn receive<P: Into<TL::RecvData>>(
         &mut self,
@@ -26,12 +32,12 @@ impl<TL: TransportLayer> SeqEx<TL> {
         seq_no: SeqNo,
         reply_no: Option<SeqNo>,
         packet: P,
-    ) -> Result<(ReplyGuard<'_, TL>, P, Option<TL::SendData>), Error> {
+    ) -> Result<RecvSuccess<'_, TL, P>, Error> {
         self.receive_raw(app.clone(), seq_no, reply_no, packet)
-            .map(|(reply_no, packet, data)| (ReplyGuard(self, app, reply_no), packet, data))
+            .map(|(reply_no, packet, send_data)| RecvSuccess { guard: ReplyGuard(self, app, reply_no), packet, send_data })
     }
-    pub fn pump(&mut self, app: TL) -> Result<(ReplyGuard<'_, TL>, TL::RecvData, Option<TL::SendData>), Error> {
+    pub fn pump(&mut self, app: TL) -> Result<RecvSuccess<'_, TL, TL::RecvData>, Error> {
         self.pump_raw()
-            .map(|(reply_no, packet, data)| (ReplyGuard(self, app, reply_no), packet, data))
+            .map(|(reply_no, packet, send_data)| RecvSuccess { guard: ReplyGuard(self, app, reply_no), packet, send_data })
     }
 }

@@ -4,7 +4,7 @@ use std::{
     time::Duration,
 };
 
-use seq_ex::sync::{MpscTransport, PacketType, ReplyGuard, SeqExSync};
+use seq_ex::sync::{MpscTransport, PacketType, RecvSuccess, ReplyGuard, SeqExSync};
 
 #[derive(Clone)]
 enum Packet {
@@ -52,9 +52,9 @@ fn receive<'a>(
                 let result = seq.receive_empty_reply(reply_no);
                 result.is_some()
             }
-            Ok(PacketType::Data { seq_no, reply_no, payload }) => {
-                if let Ok((guard, recv_packet, send_packet)) = seq.receive(transport, seq_no, reply_no, payload) {
-                    process(guard, recv_packet, send_packet, value);
+            Ok(PacketType::Payload { seq_no, reply_no, payload }) => {
+                if let Ok(RecvSuccess { guard, packet, send_data }) = seq.receive(transport, seq_no, reply_no, payload) {
+                    process(guard, packet, send_data, value);
                     true
                 } else {
                     false
@@ -63,8 +63,8 @@ fn receive<'a>(
             _ => return,
         };
         if do_pump {
-            while let Ok((guard, recv_packet, send_packet)) = seq.pump(transport) {
-                process(guard, recv_packet, send_packet, value);
+            while let Ok(RecvSuccess { guard, packet, send_data }) = seq.pump(transport) {
+                process(guard, packet, send_data, value);
             }
         }
     }

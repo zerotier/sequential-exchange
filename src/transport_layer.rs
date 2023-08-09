@@ -10,9 +10,11 @@ pub trait TransportLayer: Sized + Clone {
     type RecvData;
     type SendData;
 
-    fn time(&self) -> i64;
+    fn time(&mut self) -> i64;
+    #[allow(unused)]
+    fn update_service_time(&mut self, current_time: i64, timestamp: i64) {}
 
-    fn send(&self, seq_no: SeqNo, reply_no: Option<SeqNo>, payload: &Self::SendData);
-    fn send_ack(&self, reply_no: SeqNo);
-    fn send_empty_reply(&self, reply_no: SeqNo);
+    fn send(&mut self, seq_no: SeqNo, reply_no: Option<SeqNo>, payload: &Self::SendData);
+    fn send_ack(&mut self, reply_no: SeqNo);
+    fn send_empty_reply(&mut self, reply_no: SeqNo);
 }

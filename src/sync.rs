@@ -35,6 +35,12 @@ impl<'a, TL: TransportLayer> Drop for ReplyGuard<'a, TL> {
     }
 }
 
+pub struct RecvSuccess<'a, TL: TransportLayer, P> {
+    pub guard: ReplyGuard<'a, TL>,
+    pub packet: P,
+    pub send_data: Option<TL::SendData>,
+}
+
 impl<TL: TransportLayer> SeqExSync<TL> {
     pub fn new(retry_interval: i64, initial_seq_no: SeqNo) -> Self {
         Self {
@@ -50,17 +56,17 @@ impl<TL: TransportLayer> SeqExSync<TL> {
         seq_no: SeqNo,
         reply_no: Option<SeqNo>,
         packet: P,
-    ) -> Result<(ReplyGuard<'_, TL>, P, Option<TL::SendData>), Error> {
+    ) -> Result<RecvSuccess<'_, TL, P>, Error> {
         let mut seq = self.lock();
         let ret = seq.receive_raw(app.clone(), seq_no, reply_no, packet);
         self.unblock(ret.is_ok());
-        ret.map(|(reply_no, packet, data)| (ReplyGuard(self, app, reply_no), packet, data))
+        ret.map(|(reply_no, packet, send_data)| RecvSuccess { guard: ReplyGuard(self, app, reply_no), packet, send_data })
     }
-    pub fn pump(&self, app: TL) -> Result<(ReplyGuard<'_, TL>, TL::RecvData, Option<TL::SendData>), Error> {
+    pub fn pump(&self, app: TL) -> Result<RecvSuccess<'_, TL, TL::RecvData>, Error> {
         let mut seq = self.lock();
         let ret = seq.pump_raw();
         self.unblock(ret.is_ok());
-        ret.map(|(reply_no, packet, data)| (ReplyGuard(self, app, reply_no), packet, data))
+        ret.map(|(reply_no, packet, send_data)| RecvSuccess { guard: ReplyGuard(self, app, reply_no), packet, send_data })
     }
     #[inline]
     fn unblock(&self, is_ok: bool) {
@@ -109,7 +115,7 @@ impl<TL: TransportLayer> Default for SeqExSync<TL> {
 
 #[derive(Clone)]
 pub enum PacketType<Payload: Clone> {
-    Data {
+    Payload {
         seq_no: SeqNo,
         reply_no: Option<SeqNo>,
         payload: Payload,
@@ -140,17 +146,17 @@ impl<Payload: Clone> TransportLayer for &MpscTransport<Payload> {
     type RecvData = Payload;
     type SendData = Payload;
 
-    fn time(&self) -> i64 {
+    fn time(&mut self) -> i64 {
         self.time.elapsed().as_millis() as i64
     }
 
-    fn send(&self, seq_no: SeqNo, reply_no: Option<SeqNo>, payload: &Payload) {
-        let _ = self.channel.send(PacketType::Data { seq_no, reply_no, payload: payload.clone() });
+    fn send(&mut self, seq_no: SeqNo, reply_no: Option<SeqNo>, payload: &Payload) {
+        let _ = self.channel.send(PacketType::Payload { seq_no, reply_no, payload: payload.clone() });
     }
-    fn send_ack(&self, reply_no: SeqNo) {
+    fn send_ack(&mut self, reply_no: SeqNo) {
         let _ = self.channel.send(PacketType::Ack { reply_no });
     }
-    fn send_empty_reply(&self, reply_no: SeqNo) {
+    fn send_empty_reply(&mut self, reply_no: SeqNo) {
         let _ = self.channel.send(PacketType::EmptyReply { reply_no });
     }
 }
