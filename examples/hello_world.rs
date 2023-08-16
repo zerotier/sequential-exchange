@@ -1,6 +1,6 @@
 use std::sync::mpsc::Receiver;
 
-use seq_ex::sync::{MpscTransport, PacketType, RecvSuccess, ReplyGuard, SeqExSync};
+use seq_ex::sync::{MpscTransport, PacketType, RecvSuccess, MpscGuard, MpscSeqEx};
 
 #[derive(Clone, Debug)]
 enum Packet {
@@ -11,7 +11,7 @@ enum Packet {
 }
 use Packet::*;
 
-fn process(guard: ReplyGuard<'_, &MpscTransport<Packet>>, recv_packet: Packet, send_packet: Option<Packet>) {
+fn process(guard: MpscGuard<'_, Packet>, recv_packet: Packet, send_packet: Option<Packet>) {
     match (recv_packet, send_packet) {
         (Hello, None) => {
             print!("Hello");
@@ -37,16 +37,16 @@ fn process(guard: ReplyGuard<'_, &MpscTransport<Packet>>, recv_packet: Packet, s
     }
 }
 
-fn receive<'a>(recv: &Receiver<PacketType<Packet>>, seq: &SeqExSync<&'a MpscTransport<Packet>>, transport: &'a MpscTransport<Packet>) {
+fn receive(recv: &Receiver<PacketType<Packet>>, seq: &MpscSeqEx<Packet>, transport: &MpscTransport<Packet>) {
     match recv.recv().unwrap() {
-        PacketType::Ack { reply_no } => {
+        PacketType::Ack ( reply_no ) => {
             let result = seq.receive_ack(reply_no);
             if let Ok(Exclamation) = result {
                 // Our Hello World exchange ends right here.
                 print!("\n");
             }
         }
-        PacketType::Payload { seq_no, reply_no, payload } => {
+        PacketType::Payload ( seq_no, reply_no, payload ) => {
             for RecvSuccess { guard, packet, send_data } in seq.receive_all(transport, seq_no, reply_no, payload) {
                 process(guard, packet, send_data)
             }
@@ -57,8 +57,8 @@ fn receive<'a>(recv: &Receiver<PacketType<Packet>>, seq: &SeqExSync<&'a MpscTran
 fn main() {
     let (transport1, recv2) = MpscTransport::new();
     let (transport2, recv1) = MpscTransport::new();
-    let seq1 = SeqExSync::default();
-    let seq2 = SeqExSync::default();
+    let seq1 = MpscSeqEx::default();
+    let seq2 = MpscSeqEx::default();
 
     // We begin a "Hello World" exchange right here.
     seq1.send(&transport1, Packet::Hello);

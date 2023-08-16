@@ -48,7 +48,7 @@ pub const DEFAULT_INITIAL_SEQ_NO: SeqNo = 1;
 
 pub const DEFAULT_WINDOW_CAP: usize = 64;
 
-pub struct SeqEx<TL: TransportLayer, const CAP: usize = DEFAULT_WINDOW_CAP> {
+pub struct SeqEx<SendData, RecvData, const CAP: usize = DEFAULT_WINDOW_CAP> {
     /// The interval at which packets will be resent if they have not yet been acknowledged by the
     /// remote peer.
     /// It can be statically or dynamically set, it is up to the user to decide.
@@ -57,8 +57,8 @@ pub struct SeqEx<TL: TransportLayer, const CAP: usize = DEFAULT_WINDOW_CAP> {
     next_send_seq_no: SeqNo,
     pre_recv_seq_no: SeqNo,
     /// This could be made more efficient by changing to SoA format.
-    send_window: [Option<SendEntry<TL>>; CAP],
-    recv_window: [Option<RecvEntry<TL>>; CAP],
+    send_window: [Option<SendEntry<SendData>>; CAP],
+    recv_window: [Option<RecvEntry<RecvData>>; CAP],
     /// The size of this array determines the maximum number of received packets that the application
     /// may attempt to process concurrently before new received packets start being dropped.
     concurrent_replies: [SeqNo; CAP],
@@ -69,17 +69,17 @@ pub struct SeqEx<TL: TransportLayer, const CAP: usize = DEFAULT_WINDOW_CAP> {
     concurrent_replies_total: usize,
 }
 
-struct RecvEntry<TL: TransportLayer> {
+struct RecvEntry<RecvData> {
     seq_no: SeqNo,
     reply_no: Option<SeqNo>,
-    data: TL::RecvData,
+    data: RecvData,
 }
 
-struct SendEntry<TL: TransportLayer> {
+struct SendEntry<SendData> {
     seq_no: SeqNo,
     reply_no: Option<SeqNo>,
     next_resend_time: i64,
-    data: TL::SendData,
+    data: SendData,
 }
 
 /// The error type for when a packet has been received, but for whatever reason could not be
@@ -97,7 +97,7 @@ pub enum Error {
 /// An iterator over all packets in the send window. It will iterate over all packets currently
 /// being sent to the remote peer.
 /// These packets are awaiting a reply from the remote peer.
-pub struct Iter<'a, TL: TransportLayer>(core::slice::Iter<'a, Option<SendEntry<TL>>>);
+pub struct Iter<'a, SendData>(core::slice::Iter<'a, Option<SendEntry<SendData>>>);
 /// A mutable iterator over all packets in the send window.
 ///
 /// The user is able to mutate the contents of the packet being sent to the remote peer, as well as
@@ -107,9 +107,9 @@ pub struct Iter<'a, TL: TransportLayer>(core::slice::Iter<'a, Option<SendEntry<T
 /// version of the packet will have been received by the remote peer. The local peer cannot be sure
 /// if the remote peer will see the modified packet. For this reason it is not recommended to modify
 /// the packet.
-pub struct IterMut<'a, TL: TransportLayer>(core::slice::IterMut<'a, Option<SendEntry<TL>>>);
+pub struct IterMut<'a, SendData>(core::slice::IterMut<'a, Option<SendEntry<SendData>>>);
 
-impl<TL: TransportLayer, const CAP: usize> SeqEx<TL, CAP> {
+impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
     /// Creates a new instance of `SeqEx` for a new remote peer.
     /// An instance of `SeqEx` expects to communicate with only exactly one other remote instance
     /// of `SeqEx`.
@@ -131,10 +131,10 @@ impl<TL: TransportLayer, const CAP: usize> SeqEx<TL, CAP> {
             concurrent_replies_total: 0,
         }
     }
-    fn send_window_slot_mut(&mut self, seq_no: SeqNo) -> &mut Option<SendEntry<TL>> {
+    fn send_window_slot_mut(&mut self, seq_no: SeqNo) -> &mut Option<SendEntry<SendData>> {
         &mut self.send_window[seq_no as usize % self.send_window.len()]
     }
-    fn send_window_slot(&self, seq_no: SeqNo) -> &Option<SendEntry<TL>> {
+    fn send_window_slot(&self, seq_no: SeqNo) -> &Option<SendEntry<SendData>> {
         &self.send_window[seq_no as usize % self.send_window.len()]
     }
 
@@ -171,7 +171,7 @@ impl<TL: TransportLayer, const CAP: usize> SeqEx<TL, CAP> {
     /// user would like. However this choice of units must be consistent with the units of the
     /// `retry_interval`. `current_time` does not have to be monotonically increasing.
     #[must_use = "The queue might be full causing the packet to not be sent"]
-    pub fn try_send(&mut self, mut app: TL, packet_data: TL::SendData) -> Result<(), TL::SendData> {
+    pub fn try_send(&mut self, mut app: impl TransportLayer<SendData = SendData>, packet_data: SendData) -> Result<(), SendData> {
         if self.is_full() {
             return Err(packet_data);
         }
@@ -192,13 +192,13 @@ impl<TL: TransportLayer, const CAP: usize> SeqEx<TL, CAP> {
         Ok(())
     }
 
-    pub fn receive_raw<P: Into<TL::RecvData>>(
+    pub fn receive_raw<P: Into<RecvData>>(
         &mut self,
-        mut app: TL,
+        mut app: impl TransportLayer<SendData = SendData>,
         seq_no: SeqNo,
         reply_no: Option<SeqNo>,
         packet: P,
-    ) -> Result<(SeqNo, P, Option<TL::SendData>), Error> {
+    ) -> Result<(SeqNo, P, Option<SendData>), Error> {
         // We only want to accept packets with sequence numbers in the range:
         // `self.pre_recv_seq_no < seq_no <= self.pre_recv_seq_no + self.recv_window.len()`.
         // To check that range we compute `seq_no - (self.pre_recv_seq_no + 1)` and check
@@ -270,7 +270,7 @@ impl<TL: TransportLayer, const CAP: usize> SeqEx<TL, CAP> {
             }
         }
     }
-    pub fn receive_ack(&mut self, reply_no: SeqNo) -> Result<TL::SendData, Error> {
+    pub fn receive_ack(&mut self, reply_no: SeqNo) -> Result<SendData, Error> {
         let slot = self.send_window_slot_mut(reply_no);
         if slot.as_ref().map_or(false, |e| e.seq_no == reply_no) {
             let entry = slot.take().unwrap();
@@ -293,7 +293,7 @@ impl<TL: TransportLayer, const CAP: usize> SeqEx<TL, CAP> {
         false
     }
 
-    fn take_send(&mut self, reply_no: SeqNo) -> Option<TL::SendData> {
+    fn take_send(&mut self, reply_no: SeqNo) -> Option<SendData> {
         let slot = self.send_window_slot_mut(reply_no);
         if slot.as_ref().map_or(false, |e| e.seq_no == reply_no) {
             slot.take().map(|e| e.data)
@@ -301,7 +301,7 @@ impl<TL: TransportLayer, const CAP: usize> SeqEx<TL, CAP> {
             None
         }
     }
-    pub fn pump_raw(&mut self) -> Result<(SeqNo, TL::RecvData, Option<TL::SendData>), Error> {
+    pub fn pump_raw(&mut self) -> Result<(SeqNo, RecvData, Option<SendData>), Error> {
         let next_seq_no = self.pre_recv_seq_no.wrapping_add(1);
         let i = next_seq_no as usize % self.recv_window.len();
 
@@ -329,7 +329,7 @@ impl<TL: TransportLayer, const CAP: usize> SeqEx<TL, CAP> {
     /// The identifier will tell the remote peer which packets contain fragments of the file,
     /// and since each fragment will be received in order it will be trivial for them to reconstruct
     /// the original file.
-    pub fn reply_raw(&mut self, mut app: TL, reply_no: SeqNo, packet_data: TL::SendData) {
+    pub fn reply_raw(&mut self, mut app: impl TransportLayer<SendData = SendData>, reply_no: SeqNo, packet_data: SendData) {
         if self.remove_reservation(reply_no) {
             let seq_no = self.next_send_seq_no;
             self.next_send_seq_no = self.next_send_seq_no.wrapping_add(1);
@@ -352,7 +352,7 @@ impl<TL: TransportLayer, const CAP: usize> SeqEx<TL, CAP> {
             app.send(entry.seq_no, entry.reply_no, &entry.data);
         }
     }
-    pub fn ack_raw(&mut self, mut app: TL, reply_no: SeqNo) {
+    pub fn ack_raw(&mut self, mut app: impl TransportLayer<SendData = SendData>, reply_no: SeqNo) {
         if self.remove_reservation(reply_no) {
             // Acks are only sent once. There is code in `receive_raw` to handle resending
             // an ack in the event that the first one here was dropped by the network.
@@ -371,7 +371,7 @@ impl<TL: TransportLayer, const CAP: usize> SeqEx<TL, CAP> {
         false
     }
 
-    pub fn service(&mut self, mut app: TL) -> i64 {
+    pub fn service(&mut self, mut app: impl TransportLayer<SendData = SendData>) -> i64 {
         let current_time = app.time();
         let next_interval = current_time + self.resend_interval;
         let mut next_activity = i64::MAX;
@@ -388,29 +388,29 @@ impl<TL: TransportLayer, const CAP: usize> SeqEx<TL, CAP> {
         self.resend_interval.min(next_activity - current_time)
     }
 
-    pub fn iter(&self) -> Iter<'_, TL> {
+    pub fn iter(&self) -> Iter<'_, SendData> {
         Iter(self.send_window.iter())
     }
-    pub fn iter_mut(&mut self) -> IterMut<'_, TL> {
+    pub fn iter_mut(&mut self) -> IterMut<'_, SendData> {
         IterMut(self.send_window.iter_mut())
     }
 }
-impl<TL: TransportLayer> Default for SeqEx<TL> {
+impl<SendData, RecvData, const CAP: usize> Default for SeqEx<SendData, RecvData, CAP> {
     fn default() -> Self {
         Self::new(DEFAULT_RESEND_INTERVAL_MS, DEFAULT_INITIAL_SEQ_NO)
     }
 }
-impl<'a, TL: TransportLayer> IntoIterator for &'a SeqEx<TL> {
-    type Item = &'a TL::SendData;
-    type IntoIter = Iter<'a, TL>;
+impl<'a, SendData, RecvData, const CAP: usize> IntoIterator for &'a SeqEx<SendData, RecvData, CAP> {
+    type Item = &'a SendData;
+    type IntoIter = Iter<'a, SendData>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.iter()
     }
 }
-impl<'a, TL: TransportLayer> IntoIterator for &'a mut SeqEx<TL> {
-    type Item = &'a mut TL::SendData;
-    type IntoIter = IterMut<'a, TL>;
+impl<'a, SendData, RecvData, const CAP: usize> IntoIterator for &'a mut SeqEx<SendData, RecvData, CAP> {
+    type Item = &'a mut SendData;
+    type IntoIter = IterMut<'a, SendData>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.iter_mut()
@@ -419,8 +419,8 @@ impl<'a, TL: TransportLayer> IntoIterator for &'a mut SeqEx<TL> {
 
 macro_rules! iterator {
     ($iter:ident, {$( $mut:tt )?}) => {
-        impl<'a, TL: TransportLayer> Iterator for $iter<'a, TL> {
-            type Item = &'a $($mut)? TL::SendData;
+        impl<'a, SendData> Iterator for $iter<'a, SendData> {
+            type Item = &'a $($mut)? SendData;
             fn next(&mut self) -> Option<Self::Item> {
                 while let Some(entry) = self.0.next() {
                     if let Some(entry) = entry {
@@ -434,7 +434,7 @@ macro_rules! iterator {
                 (0, Some(self.0.len()))
             }
         }
-        impl<'a, TL: TransportLayer> DoubleEndedIterator for $iter<'a, TL> {
+        impl<'a, SendData> DoubleEndedIterator for $iter<'a, SendData> {
             fn next_back(&mut self) -> Option<Self::Item> {
                 while let Some(entry) = self.0.next_back() {
                     if let Some(entry) = entry {

@@ -10,8 +10,12 @@ path = "src/lib.rs"
 doc = true
 
 [features]
-default = ["std"]
+default = ["std", "serde"]
 std = []
+
+[dependencies]
+serde = { version = "1.0.183", default-features = false, features = ["derive"], optional = true }
 
 [dev-dependencies]
 rand_core = { version = "0.6.4", features = ["getrandom"]}
+serde_json = { version = "1.0.104" }

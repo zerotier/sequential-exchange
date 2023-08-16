@@ -1,6 +1,6 @@
 use std::{sync::mpsc::Receiver, thread, time::Duration};
 
-use seq_ex::sync::{MpscTransport, PacketType, RecvSuccess, ReplyGuard, SeqExSync};
+use seq_ex::sync::{MpscTransport, PacketType, RecvSuccess, MpscGuard, MpscSeqEx};
 
 #[derive(Clone)]
 enum Packet {
@@ -16,7 +16,7 @@ fn drop_packet() -> bool {
     rand_core::OsRng.next_u32() & 1 > 0
 }
 
-fn process(_: ReplyGuard<'_, &MpscTransport<Packet>>, recv_packet: Packet, _: Option<Packet>, value: &mut f32) {
+fn process(_: MpscGuard<'_, Packet>, recv_packet: Packet, _: Option<Packet>, value: &mut f32) {
     use Packet::*;
     match recv_packet {
         Add(n) => *value = *value + n,
@@ -29,17 +29,17 @@ fn process(_: ReplyGuard<'_, &MpscTransport<Packet>>, recv_packet: Packet, _: Op
 
 fn receive<'a>(
     recv: &Receiver<PacketType<Packet>>,
-    seq: &SeqExSync<&'a MpscTransport<Packet>>,
+    seq: &MpscSeqEx<Packet>,
     transport: &'a MpscTransport<Packet>,
     value: &mut f32,
 ) {
     while let Ok(packet) = recv.try_recv() {
         if !drop_packet() {
             match packet {
-                PacketType::Ack { reply_no } => {
+                PacketType::Ack ( reply_no ) => {
                     let _ = seq.receive_ack(reply_no);
                 }
-                PacketType::Payload { seq_no, reply_no, payload } => {
+                PacketType::Payload ( seq_no, reply_no, payload ) => {
                     for RecvSuccess { guard, packet, send_data } in seq.receive_all(transport, seq_no, reply_no, payload) {
                         process(guard, packet, send_data, value);
                     }
@@ -52,8 +52,8 @@ fn receive<'a>(
 fn main() {
     let (transport1, recv2) = MpscTransport::new();
     let (transport2, recv1) = MpscTransport::new();
-    let seq1 = SeqExSync::new(5, 1);
-    let seq2 = SeqExSync::new(5, 1);
+    let seq1 = MpscSeqEx::new(5, 1);
+    let seq2 = MpscSeqEx::new(5, 1);
     let mut value = 0.0;
     let mut remote_value = value;
 
@@ -68,7 +68,7 @@ fn main() {
     seq1.send(&transport1, Packet::Mod(5.0));
     value %= 5.0;
 
-    for _ in 0..30 {
+    for _ in 0..16 {
         receive(&recv1, &seq1, &transport1, &mut value);
         receive(&recv2, &seq2, &transport2, &mut remote_value);
         thread::sleep(Duration::from_millis(5));

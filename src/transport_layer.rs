@@ -7,7 +7,6 @@ use crate::SeqNo;
 /// It is possible through these generics to make SeqEx no-alloc and zero-copy, but otherwise
 /// they are most easily implemented as some combination of custom enums, `Vec<u8>` and `Arc<[u8]>`.
 pub trait TransportLayer: Clone {
-    type RecvData;
     type SendData;
 
     fn time(&mut self) -> i64;
