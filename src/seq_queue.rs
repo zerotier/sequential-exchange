@@ -135,7 +135,6 @@ impl<TL: TransportLayer> SeqEx<TL> {
         &self.send_window[seq_no as usize % self.send_window.len()]
     }
 
-
     /// Returns whether or not the send window is full.
     /// If the send window is full calls to `SeqEx::send` will always fail.
     pub fn is_full(&self) -> bool {
@@ -184,12 +183,7 @@ impl<TL: TransportLayer> SeqEx<TL> {
         }
         let slot = self.send_window_slot_mut(seq_no);
         debug_assert!(slot.is_none());
-        let entry = slot.insert(SendEntry {
-            seq_no,
-            reply_no: None,
-            next_resend_time,
-            data: packet_data,
-        });
+        let entry = slot.insert(SendEntry { seq_no, reply_no: None, next_resend_time, data: packet_data });
 
         app.send(entry.seq_no, entry.reply_no, &entry.data);
         Ok(())
