@@ -1,22 +1,27 @@
-use std::{sync::{mpsc::{Receiver, Sender, channel}, Arc, RwLock}, thread, time::{Duration, Instant}, collections::HashMap, ops::Deref};
+use std::{
+    collections::HashMap,
+    ops::Deref,
+    sync::{
+        mpsc::{channel, Receiver, Sender},
+        Arc, RwLock,
+    },
+    thread,
+    time::{Duration, Instant},
+};
 
-use seq_ex::{sync::{PacketType, RecvSuccess, ReplyGuard, SeqExSync}, TransportLayer, SeqNo};
-use rand_core::{RngCore, OsRng};
-use serde::{Serialize, Deserialize};
+use rand_core::{OsRng, RngCore};
+use seq_ex::{
+    sync::{PacketType, RecvSuccess, ReplyGuard, SeqExSync},
+    SeqNo, TransportLayer,
+};
+use serde::{Deserialize, Serialize};
 
 const FILE_CHUNK_SIZE: usize = 1000;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 enum Packet {
-    RequestFile {
-        filename: String,
-    },
-    ConfirmRequestFile {
-        filesize: u64,
-    },
-    FileDownload {
-        filename: String,
-        file_chunk: Vec<u8>,
-    }
+    RequestFile { filename: String },
+    ConfirmRequestFile { filesize: u64 },
+    FileDownload { filename: String, file_chunk: Vec<u8> },
 }
 
 #[derive(Clone)]
@@ -53,12 +58,11 @@ impl TransportLayer for &Transport {
     }
 }
 
-
 fn drop_packet() -> bool {
     OsRng.next_u32() >= (u32::MAX / 4 * 3)
 }
 
-fn process<'a>(peer: &Peer, guard: ReplyGuard<'_, &Transport, Packet, Packet>, recv_packet: Packet, sent_packet: Option<Packet>) {
+fn process(peer: &Peer, guard: ReplyGuard<'_, &Transport, Packet, Packet>, recv_packet: Packet, sent_packet: Option<Packet>) {
     match (recv_packet, sent_packet) {
         (Packet::RequestFile { filename }, None) => {
             let filesystem = peer.filesystem.clone();
@@ -75,7 +79,10 @@ fn process<'a>(peer: &Peer, guard: ReplyGuard<'_, &Transport, Packet, Packet>, r
                     let mut i = 0;
                     while i < file.len() {
                         let j = file.len().min(i + FILE_CHUNK_SIZE);
-                        seqex.send(&transport, Packet::FileDownload { filename: filename.clone(), file_chunk: file[i..j].to_vec() });
+                        seqex.send(
+                            &transport,
+                            Packet::FileDownload { filename: filename.clone(), file_chunk: file[i..j].to_vec() },
+                        );
                         i = j;
                     }
                 }
@@ -100,19 +107,17 @@ fn process<'a>(peer: &Peer, guard: ReplyGuard<'_, &Transport, Packet, Packet>, r
     }
 }
 
-fn receive<'a>(
-    peer: &Peer,
-) {
+fn receive(peer: &Peer) {
     while let Ok(packet) = peer.receiver.try_recv() {
         if drop_packet() {
             continue;
         }
         let parsed_packet = serde_json::from_slice::<PacketType<Packet>>(&packet);
         match parsed_packet {
-            Ok(PacketType::Ack ( reply_no )) => {
+            Ok(PacketType::Ack(reply_no)) => {
                 let _ = peer.seqex.receive_ack(reply_no);
             }
-            Ok(PacketType::Payload ( seq_no, reply_no, payload )) => {
+            Ok(PacketType::Payload(seq_no, reply_no, payload)) => {
                 for RecvSuccess { guard, packet, send_data } in peer.seqex.receive_all(&peer.transport, seq_no, reply_no, payload) {
                     process(peer, guard, packet, send_data);
                 }
@@ -121,7 +126,6 @@ fn receive<'a>(
         }
     }
 }
-
 
 fn main() {
     let mut filesystem2 = HashMap::new();
@@ -138,12 +142,22 @@ fn main() {
     let (send1, recv2) = channel();
     let (send2, recv1) = channel();
 
-    let peer1 = Peer { filesystem: Arc::new(RwLock::new(HashMap::new())), seqex: Arc::new(SeqExSync::new(5, 1)), transport: Transport{time: Instant::now(), sender: send1}, receiver: recv1 };
-    let peer2 = Peer { filesystem: Arc::new(RwLock::new(filesystem2)), seqex: Arc::new(SeqExSync::new(5, 1)), transport: Transport{time: Instant::now(), sender: send2}, receiver: recv2 };
+    let peer1 = Peer {
+        filesystem: Arc::new(RwLock::new(HashMap::new())),
+        seqex: Arc::new(SeqExSync::new(5, 1)),
+        transport: Transport { time: Instant::now(), sender: send1 },
+        receiver: recv1,
+    };
+    let peer2 = Peer {
+        filesystem: Arc::new(RwLock::new(filesystem2)),
+        seqex: Arc::new(SeqExSync::new(5, 1)),
+        transport: Transport { time: Instant::now(), sender: send2 },
+        receiver: recv2,
+    };
 
-    peer1.seqex.send(&peer1.transport, Packet::RequestFile{filename: "File1".to_string()});
-    peer1.seqex.send(&peer1.transport, Packet::RequestFile{filename: "File3".to_string()});
-    peer1.seqex.send(&peer1.transport, Packet::RequestFile{filename: "File2".to_string()});
+    peer1.seqex.send(&peer1.transport, Packet::RequestFile { filename: "File1".to_string() });
+    peer1.seqex.send(&peer1.transport, Packet::RequestFile { filename: "File3".to_string() });
+    peer1.seqex.send(&peer1.transport, Packet::RequestFile { filename: "File2".to_string() });
 
     for _ in 0..300 {
         receive(&peer1);

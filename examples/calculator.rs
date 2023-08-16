@@ -1,6 +1,6 @@
 use std::{sync::mpsc::Receiver, thread, time::Duration};
 
-use seq_ex::sync::{MpscTransport, PacketType, RecvSuccess, MpscGuard, MpscSeqEx};
+use seq_ex::sync::{MpscGuard, MpscSeqEx, MpscTransport, PacketType, RecvSuccess};
 
 #[derive(Clone)]
 enum Packet {
@@ -27,19 +27,14 @@ fn process(_: MpscGuard<'_, Packet>, recv_packet: Packet, _: Option<Packet>, val
     }
 }
 
-fn receive<'a>(
-    recv: &Receiver<PacketType<Packet>>,
-    seq: &MpscSeqEx<Packet>,
-    transport: &'a MpscTransport<Packet>,
-    value: &mut f32,
-) {
+fn receive(recv: &Receiver<PacketType<Packet>>, seq: &MpscSeqEx<Packet>, transport: &MpscTransport<Packet>, value: &mut f32) {
     while let Ok(packet) = recv.try_recv() {
         if !drop_packet() {
             match packet {
-                PacketType::Ack ( reply_no ) => {
+                PacketType::Ack(reply_no) => {
                     let _ = seq.receive_ack(reply_no);
                 }
-                PacketType::Payload ( seq_no, reply_no, payload ) => {
+                PacketType::Payload(seq_no, reply_no, payload) => {
                     for RecvSuccess { guard, packet, send_data } in seq.receive_all(transport, seq_no, reply_no, payload) {
                         process(guard, packet, send_data, value);
                     }

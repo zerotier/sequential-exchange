@@ -1,9 +1,8 @@
-use std::cell::UnsafeCell;
-use std::sync::Condvar;
 use std::{
+    cell::UnsafeCell,
     sync::{
         mpsc::{channel, Receiver, Sender},
-        Mutex, MutexGuard,
+        Condvar, Mutex, MutexGuard,
     },
     time::Instant,
 };
@@ -18,7 +17,11 @@ pub struct SeqExSync<SendData, RecvData, const CAP: usize = DEFAULT_WINDOW_CAP> 
     send_block: Condvar,
 }
 
-pub struct ReplyGuard<'a, TL: TransportLayer<SendData = SendData>, SendData, RecvData, const CAP: usize = DEFAULT_WINDOW_CAP>(&'a SeqExSync<SendData, RecvData, CAP>, TL, SeqNo);
+pub struct ReplyGuard<'a, TL: TransportLayer<SendData = SendData>, SendData, RecvData, const CAP: usize = DEFAULT_WINDOW_CAP>(
+    &'a SeqExSync<SendData, RecvData, CAP>,
+    TL,
+    SeqNo,
+);
 impl<'a, TL: TransportLayer<SendData = SendData>, SendData, RecvData, const CAP: usize> ReplyGuard<'a, TL, SendData, RecvData, CAP> {
     /// If you need to reply more than once, say to fragment a large file, then include in your
     /// first reply some identifier, and then `send` all fragments with the same included identifier.
@@ -78,7 +81,13 @@ impl<SendData, RecvData, const CAP: usize> SeqExSync<SendData, RecvData, CAP> {
         self.unblock(ret.is_ok());
         ret.map(|(reply_no, packet, send_data)| RecvSuccess { guard: ReplyGuard(self, app, reply_no), packet, send_data })
     }
-    pub fn receive_all<TL: TransportLayer<SendData = SendData>>(&self, app: TL, seq_no: SeqNo, reply_no: Option<SeqNo>, packet: RecvData) -> ReplyIter<'_, TL, SendData, RecvData, CAP> {
+    pub fn receive_all<TL: TransportLayer<SendData = SendData>>(
+        &self,
+        app: TL,
+        seq_no: SeqNo,
+        reply_no: Option<SeqNo>,
+        packet: RecvData,
+    ) -> ReplyIter<'_, TL, SendData, RecvData, CAP> {
         if let Ok(g) = self.receive(app.clone(), seq_no, reply_no, packet) {
             ReplyIter { origin: Some(self), app, first: Some(g) }
         } else {
@@ -172,9 +181,9 @@ impl<Payload: Clone> TransportLayer for &MpscTransport<Payload> {
     }
 
     fn send(&mut self, seq_no: SeqNo, reply_no: Option<SeqNo>, payload: &Payload) {
-        let _ = self.channel.send(PacketType::Payload(seq_no, reply_no, payload.clone() ));
+        let _ = self.channel.send(PacketType::Payload(seq_no, reply_no, payload.clone()));
     }
     fn send_ack(&mut self, reply_no: SeqNo) {
-        let _ = self.channel.send(PacketType::Ack ( reply_no ));
+        let _ = self.channel.send(PacketType::Ack(reply_no));
     }
 }

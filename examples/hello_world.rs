@@ -1,6 +1,6 @@
 use std::sync::mpsc::Receiver;
 
-use seq_ex::sync::{MpscTransport, PacketType, RecvSuccess, MpscGuard, MpscSeqEx};
+use seq_ex::sync::{MpscGuard, MpscSeqEx, MpscTransport, PacketType, RecvSuccess};
 
 #[derive(Clone, Debug)]
 enum Packet {
@@ -39,14 +39,14 @@ fn process(guard: MpscGuard<'_, Packet>, recv_packet: Packet, send_packet: Optio
 
 fn receive(recv: &Receiver<PacketType<Packet>>, seq: &MpscSeqEx<Packet>, transport: &MpscTransport<Packet>) {
     match recv.recv().unwrap() {
-        PacketType::Ack ( reply_no ) => {
+        PacketType::Ack(reply_no) => {
             let result = seq.receive_ack(reply_no);
             if let Ok(Exclamation) = result {
                 // Our Hello World exchange ends right here.
                 print!("\n");
             }
         }
-        PacketType::Payload ( seq_no, reply_no, payload ) => {
+        PacketType::Payload(seq_no, reply_no, payload) => {
             for RecvSuccess { guard, packet, send_data } in seq.receive_all(transport, seq_no, reply_no, payload) {
                 process(guard, packet, send_data)
             }

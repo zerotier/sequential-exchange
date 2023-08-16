@@ -1,6 +1,10 @@
 use crate::{Error, SeqEx, SeqNo, TransportLayer, DEFAULT_WINDOW_CAP};
 
-pub struct ReplyGuard<'a, TL: TransportLayer<SendData = SendData>, SendData, RecvData, const CAP: usize = DEFAULT_WINDOW_CAP>(&'a mut SeqEx<SendData, RecvData, CAP>, TL, SeqNo);
+pub struct ReplyGuard<'a, TL: TransportLayer<SendData = SendData>, SendData, RecvData, const CAP: usize = DEFAULT_WINDOW_CAP>(
+    &'a mut SeqEx<SendData, RecvData, CAP>,
+    TL,
+    SeqNo,
+);
 impl<'a, TL: TransportLayer<SendData = SendData>, SendData, RecvData, const CAP: usize> ReplyGuard<'a, TL, SendData, RecvData, CAP> {
     /// If you need to reply more than once, say to fragment a large file, then include in your
     /// first reply some identifier, and then `send` all fragments with the same included identifier.
@@ -35,7 +39,10 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
         self.receive_raw(app.clone(), seq_no, reply_no, packet)
             .map(|(reply_no, packet, send_data)| RecvSuccess { guard: ReplyGuard(self, app, reply_no), packet, send_data })
     }
-    pub fn pump<TL: TransportLayer<SendData = SendData>>(&mut self, app: TL) -> Result<RecvSuccess<'_, TL, RecvData, SendData, RecvData, CAP>, Error> {
+    pub fn pump<TL: TransportLayer<SendData = SendData>>(
+        &mut self,
+        app: TL,
+    ) -> Result<RecvSuccess<'_, TL, RecvData, SendData, RecvData, CAP>, Error> {
         self.pump_raw()
             .map(|(reply_no, packet, send_data)| RecvSuccess { guard: ReplyGuard(self, app, reply_no), packet, send_data })
     }
