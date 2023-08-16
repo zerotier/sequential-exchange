@@ -16,7 +16,7 @@ enum Packet {
 }
 
 fn drop_packet() -> bool {
-    static RNG: Mutex<u32> = Mutex::new(12);
+    static RNG: Mutex<u32> = Mutex::new(43);
     let mut rng = RNG.lock().unwrap();
     *rng ^= *rng << 13;
     *rng ^= *rng >> 17;
@@ -41,30 +41,17 @@ fn receive<'a>(
     transport: &'a MpscTransport<Packet>,
     value: &mut f32,
 ) {
-    let packet = recv.try_recv();
-    if !drop_packet() {
-        let do_pump = match packet {
-            Ok(PacketType::Ack { reply_no }) => {
-                seq.receive_ack(reply_no);
-                return;
-            }
-            Ok(PacketType::EmptyReply { reply_no }) => {
-                let result = seq.receive_empty_reply(reply_no);
-                result.is_some()
-            }
-            Ok(PacketType::Payload { seq_no, reply_no, payload }) => {
-                if let Ok(RecvSuccess { guard, packet, send_data }) = seq.receive(transport, seq_no, reply_no, payload) {
-                    process(guard, packet, send_data, value);
-                    true
-                } else {
-                    false
+    while let Ok(packet) = recv.try_recv() {
+        if !drop_packet() {
+            match packet {
+                PacketType::EmptyReply { reply_no } => {
+                    let _ = seq.receive_empty_reply(reply_no);
                 }
-            }
-            _ => return,
-        };
-        if do_pump {
-            while let Ok(RecvSuccess { guard, packet, send_data }) = seq.pump(transport) {
-                process(guard, packet, send_data, value);
+                PacketType::Payload { seq_no, reply_no, payload } => {
+                    for RecvSuccess { guard, packet, send_data } in seq.receive_iter(transport, seq_no, reply_no, payload) {
+                        process(guard, packet, send_data, value);
+                    }
+                }
             }
         }
     }

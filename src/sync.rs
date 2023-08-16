@@ -9,19 +9,19 @@ use std::{
 };
 
 use crate::{
-    Error, SeqEx, SeqNo, TransportLayer, DEFAULT_INITIAL_SEQ_NO, DEFAULT_RECV_WINDOW_LEN, DEFAULT_RESEND_INTERVAL_MS, DEFAULT_SEND_WINDOW_LEN,
+    Error, SeqEx, SeqNo, TransportLayer, DEFAULT_INITIAL_SEQ_NO, DEFAULT_WINDOW_CAP, DEFAULT_RESEND_INTERVAL_MS,
 };
 
-pub struct SeqExSync<TL: TransportLayer, const SLEN: usize = DEFAULT_SEND_WINDOW_LEN, const RLEN: usize = DEFAULT_RECV_WINDOW_LEN> {
-    seq_ex: Mutex<SeqEx<TL, SLEN, RLEN>>,
+pub struct SeqExSync<TL: TransportLayer, const CAP: usize = DEFAULT_WINDOW_CAP> {
+    seq_ex: Mutex<SeqEx<TL, CAP>>,
     /// The mutex above is always held when this value changes, hence it is safe to mutate.
     /// We don't pack this as a component of the mutex to avoid having to reimplement MutexGuard.
     wait_count: UnsafeCell<usize>,
     send_block: Condvar,
 }
 
-pub struct ReplyGuard<'a, TL: TransportLayer>(&'a SeqExSync<TL>, TL, SeqNo);
-impl<'a, TL: TransportLayer> ReplyGuard<'a, TL> {
+pub struct ReplyGuard<'a, TL: TransportLayer, const CAP: usize = DEFAULT_WINDOW_CAP>(&'a SeqExSync<TL, CAP>, TL, SeqNo);
+impl<'a, TL: TransportLayer, const CAP: usize> ReplyGuard<'a, TL, CAP> {
     /// If you need to reply more than once, say to fragment a large file, then include in your
     /// first reply some identifier, and then `send` all fragments with the same included identifier.
     /// The identifier will tell the remote peer which packets contain fragments of the file,
@@ -33,23 +33,23 @@ impl<'a, TL: TransportLayer> ReplyGuard<'a, TL> {
         core::mem::forget(self);
     }
 }
-impl<'a, TL: TransportLayer> Drop for ReplyGuard<'a, TL> {
+impl<'a, TL: TransportLayer, const CAP: usize> Drop for ReplyGuard<'a, TL, CAP> {
     fn drop(&mut self) {
         let mut seq = self.0.seq_ex.lock().unwrap();
         seq.reply_empty_raw(self.1.clone(), self.2);
     }
 }
 
-pub struct RecvSuccess<'a, TL: TransportLayer, P> {
-    pub guard: ReplyGuard<'a, TL>,
+pub struct RecvSuccess<'a, TL: TransportLayer, P: Into<TL::RecvData>, const CAP: usize = DEFAULT_WINDOW_CAP> {
+    pub guard: ReplyGuard<'a, TL, CAP>,
     pub packet: P,
     pub send_data: Option<TL::SendData>,
 }
 
-impl<TL: TransportLayer> SeqExSync<TL> {
+impl<TL: TransportLayer, const CAP: usize> SeqExSync<TL, CAP> {
     pub fn new(retry_interval: i64, initial_seq_no: SeqNo) -> Self {
         Self {
-            seq_ex: Mutex::new(SeqEx::new(retry_interval, initial_seq_no)),
+            seq_ex: Mutex::new(SeqEx::<TL, CAP>::new(retry_interval, initial_seq_no)),
             wait_count: UnsafeCell::new(0),
             send_block: Condvar::default(),
         }
@@ -61,17 +61,31 @@ impl<TL: TransportLayer> SeqExSync<TL> {
         seq_no: SeqNo,
         reply_no: Option<SeqNo>,
         packet: P,
-    ) -> Result<RecvSuccess<'_, TL, P>, Error> {
+    ) -> Result<RecvSuccess<'_, TL, P, CAP>, Error> {
         let mut seq = self.lock();
         let ret = seq.receive_raw(app.clone(), seq_no, reply_no, packet);
+        // TODO: double check blocking.
         self.unblock(ret.is_ok());
         ret.map(|(reply_no, packet, send_data)| RecvSuccess { guard: ReplyGuard(self, app, reply_no), packet, send_data })
     }
-    pub fn pump(&self, app: TL) -> Result<RecvSuccess<'_, TL, TL::RecvData>, Error> {
+    pub fn pump(&self, app: TL) -> Result<RecvSuccess<'_, TL, TL::RecvData, CAP>, Error> {
         let mut seq = self.lock();
         let ret = seq.pump_raw();
         self.unblock(ret.is_ok());
         ret.map(|(reply_no, packet, send_data)| RecvSuccess { guard: ReplyGuard(self, app, reply_no), packet, send_data })
+    }
+    pub fn receive_iter(
+        &self,
+        app: TL,
+        seq_no: SeqNo,
+        reply_no: Option<SeqNo>,
+        packet: TL::RecvData,
+    ) -> ReplyIter<'_, TL, CAP> {
+        if let Ok(g) = self.receive(app.clone(), seq_no, reply_no, packet) {
+            ReplyIter { origin: Some(self), app, first: Some(g) }
+        } else {
+            ReplyIter { origin: None, app, first: None }
+        }
     }
     #[inline]
     fn unblock(&self, is_ok: bool) {
@@ -94,21 +108,16 @@ impl<TL: TransportLayer> SeqExSync<TL> {
         }
     }
 
-    pub fn receive_ack(&self, reply_no: SeqNo) {
-        self.lock().receive_ack(reply_no)
-    }
-    pub fn receive_empty_reply(&self, reply_no: SeqNo) -> Option<TL::SendData> {
+    pub fn receive_empty_reply(&self, reply_no: SeqNo) -> Result<TL::SendData, Error> {
         let ret = self.lock().receive_empty_reply(reply_no);
-        if ret.is_some() {
-            self.send_block.notify_one();
-        }
+        self.unblock(ret.is_ok());
         ret
     }
     pub fn service(&self, app: TL) -> i64 {
         self.lock().service(app)
     }
 
-    pub fn lock(&self) -> MutexGuard<SeqEx<TL>> {
+    pub fn lock(&self) -> MutexGuard<SeqEx<TL, CAP>> {
         self.seq_ex.lock().unwrap()
     }
 }
@@ -118,15 +127,31 @@ impl<TL: TransportLayer> Default for SeqExSync<TL> {
     }
 }
 
+pub struct ReplyIter<'a, TL: TransportLayer, const CAP: usize = DEFAULT_WINDOW_CAP> {
+    origin: Option<&'a SeqExSync<TL, CAP>>,
+    app: TL,
+    first: Option<RecvSuccess<'a, TL, TL::RecvData, CAP>>
+}
+
+impl<'a, TL: TransportLayer> Iterator for ReplyIter<'a, TL> {
+    type Item = RecvSuccess<'a, TL, TL::RecvData>;
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(g) = self.first.take() {
+            Some(g)
+        } else if let Some(origin) = self.origin {
+            origin.pump(self.app.clone()).ok()
+        } else {
+            None
+        }
+    }
+}
+
 #[derive(Clone)]
 pub enum PacketType<Payload: Clone> {
     Payload {
         seq_no: SeqNo,
         reply_no: Option<SeqNo>,
         payload: Payload,
-    },
-    Ack {
-        reply_no: SeqNo,
     },
     EmptyReply {
         reply_no: SeqNo,
@@ -157,9 +182,6 @@ impl<Payload: Clone> TransportLayer for &MpscTransport<Payload> {
 
     fn send(&mut self, seq_no: SeqNo, reply_no: Option<SeqNo>, payload: &Payload) {
         let _ = self.channel.send(PacketType::Payload { seq_no, reply_no, payload: payload.clone() });
-    }
-    fn send_ack(&mut self, reply_no: SeqNo) {
-        let _ = self.channel.send(PacketType::Ack { reply_no });
     }
     fn send_empty_reply(&mut self, reply_no: SeqNo) {
         let _ = self.channel.send(PacketType::EmptyReply { reply_no });

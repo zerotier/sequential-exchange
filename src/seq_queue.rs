@@ -46,10 +46,9 @@ pub const DEFAULT_RESEND_INTERVAL_MS: i64 = 200;
 /// The initial sequence number for a default instance of SeqEx.
 pub const DEFAULT_INITIAL_SEQ_NO: SeqNo = 1;
 
-pub const DEFAULT_SEND_WINDOW_LEN: usize = 64;
-pub const DEFAULT_RECV_WINDOW_LEN: usize = 64;
+pub const DEFAULT_WINDOW_CAP: usize = 64;
 
-pub struct SeqEx<TL: TransportLayer, const SLEN: usize = DEFAULT_SEND_WINDOW_LEN, const RLEN: usize = DEFAULT_RECV_WINDOW_LEN> {
+pub struct SeqEx<TL: TransportLayer, const CAP: usize = DEFAULT_WINDOW_CAP> {
     /// The interval at which packets will be resent if they have not yet been acknowledged by the
     /// remote peer.
     /// It can be statically or dynamically set, it is up to the user to decide.
@@ -57,12 +56,16 @@ pub struct SeqEx<TL: TransportLayer, const SLEN: usize = DEFAULT_SEND_WINDOW_LEN
     pub next_service_timestamp: i64,
     next_send_seq_no: SeqNo,
     pre_recv_seq_no: SeqNo,
-    /// This could be made more efficient in SoA format.
-    send_window: [Option<SendEntry<TL>>; SLEN],
-    recv_window: [Option<RecvEntry<TL>>; RLEN],
-    /// The size of this array determines the maximum number of received packets that the
-    /// application may attempt to process concurrently before new received packets start being dropped.
-    concurrent_replies: [SeqNo; RLEN],
+    /// This could be made more efficient by changing to SoA format.
+    send_window: [Option<SendEntry<TL>>; CAP],
+    recv_window: [Option<RecvEntry<TL>>; CAP],
+    /// The size of this array determines the maximum number of received packets that the application
+    /// may attempt to process concurrently before new received packets start being dropped.
+    concurrent_replies: [SeqNo; CAP],
+    /// The total number of concurrent replies being processed. When a packet is received, a reply
+    /// number is issued for that packet. That reply number reserves resources for itself, so that
+    /// when `reply_raw` or `reply_empty_raw` are called with it, they are guaranteed not to fail.
+    /// To accomplish this we must track all issued reply numbers.
     concurrent_replies_total: usize,
 }
 
@@ -106,7 +109,7 @@ pub struct Iter<'a, TL: TransportLayer>(core::slice::Iter<'a, Option<SendEntry<T
 /// the packet.
 pub struct IterMut<'a, TL: TransportLayer>(core::slice::IterMut<'a, Option<SendEntry<TL>>>);
 
-impl<TL: TransportLayer> SeqEx<TL> {
+impl<TL: TransportLayer, const CAP: usize> SeqEx<TL, CAP> {
     /// Creates a new instance of `SeqEx` for a new remote peer.
     /// An instance of `SeqEx` expects to communicate with only exactly one other remote instance
     /// of `SeqEx`.
@@ -140,7 +143,7 @@ impl<TL: TransportLayer> SeqEx<TL> {
     pub fn is_full(&self) -> bool {
         // We claim that the window is full one entry before it is actually full for the sake of
         // making it always possible for both peers to process at least one reply at all times.
-        self.is_full_inner(1)
+        self.is_full_inner(true)
     }
     /// Returns the next sequence number to be attached to the next sent packet.
     /// This should be called before `SeqEx::send`, and the return value should be
@@ -214,13 +217,13 @@ impl<TL: TransportLayer> SeqEx<TL> {
             // If either are the case then we know we will eventually send a reply to the packet.
             // If neither are the case then we must send an empty reply so the remote peer can stop
             // resending the packet.
-            for entry in &self.send_window {
-                if entry.as_ref().map_or(false, |e| e.reply_no == Some(seq_no)) {
+            for entry in self.send_window.iter().flatten() {
+                if entry.reply_no == Some(seq_no) {
                     return Err(Error::OutOfSequence);
                 }
             }
-            for reply_no in self.concurrent_replies {
-                if reply_no == seq_no {
+            for i in 0..self.concurrent_replies_total {
+                if self.concurrent_replies[i] == seq_no {
                     return Err(Error::OutOfSequence);
                 }
             }
@@ -232,7 +235,7 @@ impl<TL: TransportLayer> SeqEx<TL> {
         // If the send window is full we cannot safely process received packets,
         // because there would be no way to reply.
         // We can only process this packet if processing it would make space in the send window.
-        let is_full = self.is_full_inner(0);
+        let is_full = self.is_full_inner(false);
 
         let i = seq_no as usize % self.recv_window.len();
         if let Some(pre) = self.recv_window[i].as_mut() {
@@ -240,7 +243,6 @@ impl<TL: TransportLayer> SeqEx<TL> {
                 if is_next && !is_full {
                     self.recv_window[i] = None;
                 } else {
-                    app.send_ack(seq_no);
                     return if is_full {
                         Err(Error::WindowIsFull)
                     } else {
@@ -261,10 +263,6 @@ impl<TL: TransportLayer> SeqEx<TL> {
             Ok((seq_no, packet, data))
         } else {
             self.recv_window[i] = Some(RecvEntry { seq_no, reply_no, data: packet.into() });
-            if let Some(reply_no) = reply_no {
-                self.receive_ack(reply_no);
-            }
-            app.send_ack(seq_no);
             if is_full {
                 Err(Error::WindowIsFull)
             } else {
@@ -272,29 +270,21 @@ impl<TL: TransportLayer> SeqEx<TL> {
             }
         }
     }
-    pub fn receive_ack(&mut self, reply_no: SeqNo) {
-        let slot = self.send_window_slot_mut(reply_no);
-        if let Some(entry) = slot.as_mut() {
-            if entry.seq_no == reply_no {
-                entry.next_resend_time = i64::MAX;
-            }
-        }
-    }
-    pub fn receive_empty_reply(&mut self, reply_no: SeqNo) -> Option<TL::SendData> {
+    pub fn receive_empty_reply(&mut self, reply_no: SeqNo) -> Result<TL::SendData, Error> {
         let slot = self.send_window_slot_mut(reply_no);
         if slot.as_ref().map_or(false, |e| e.seq_no == reply_no) {
             let entry = slot.take().unwrap();
-            Some(entry.data)
+            Ok(entry.data)
         } else {
-            None
+            Err(Error::OutOfSequence)
         }
     }
 
-    fn is_full_inner(&self, bias: u32) -> bool {
+    fn is_full_inner(&self, reserve_one: bool) -> bool {
         if self.concurrent_replies_total >= self.concurrent_replies.len() {
             return true;
         }
-        for i in 0..self.concurrent_replies_total as u32 + 1 + bias {
+        for i in 0..self.concurrent_replies_total as u32 + 1 + reserve_one as u32 {
             let slot = self.send_window_slot(self.next_send_seq_no.wrapping_add(i));
             if slot.is_some() {
                 return true;
@@ -316,7 +306,7 @@ impl<TL: TransportLayer> SeqEx<TL> {
         let i = next_seq_no as usize % self.recv_window.len();
 
         if self.recv_window[i].as_ref().map_or(false, |pre| pre.seq_no == next_seq_no) {
-            if self.is_full_inner(0) {
+            if self.is_full_inner(false) {
                 return Err(Error::WindowIsFull);
             }
 
@@ -350,7 +340,7 @@ impl<TL: TransportLayer> SeqEx<TL> {
                 self.next_service_timestamp = next_resend_time;
                 app.update_service_time(next_resend_time, current_time);
             }
-            let slot = self.send_window_slot_mut(reply_no);
+            let slot = self.send_window_slot_mut(seq_no);
             debug_assert!(slot.is_none());
             let entry = slot.insert(SendEntry {
                 seq_no,

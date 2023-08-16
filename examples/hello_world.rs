@@ -38,31 +38,18 @@ fn process(guard: ReplyGuard<'_, &MpscTransport<Packet>>, recv_packet: Packet, s
 }
 
 fn receive<'a>(recv: &Receiver<PacketType<Packet>>, seq: &SeqExSync<&'a MpscTransport<Packet>>, transport: &'a MpscTransport<Packet>) {
-    let do_pump = match recv.recv().unwrap() {
-        PacketType::Ack { reply_no } => {
-            seq.receive_ack(reply_no);
-            return;
-        }
+    match recv.recv().unwrap() {
         PacketType::EmptyReply { reply_no } => {
             let result = seq.receive_empty_reply(reply_no);
-            if let Some(Exclamation) = &result {
+            if let Ok(Exclamation) = result {
                 // Our Hello World exchange ends right here.
                 print!("\n");
             }
-            result.is_some()
         }
         PacketType::Payload { seq_no, reply_no, payload } => {
-            if let Ok(RecvSuccess { guard, packet, send_data }) = seq.receive(transport, seq_no, reply_no, payload) {
-                process(guard, packet, send_data);
-                true
-            } else {
-                false
+            for RecvSuccess {guard, packet, send_data} in seq.receive_iter(transport, seq_no, reply_no, payload) {
+                process(guard, packet, send_data)
             }
-        }
-    };
-    if do_pump {
-        while let Ok(RecvSuccess { guard, packet, send_data }) = seq.pump(transport) {
-            process(guard, packet, send_data);
         }
     }
 }
