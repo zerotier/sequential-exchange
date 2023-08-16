@@ -47,7 +47,7 @@ fn receive<'a>(recv: &Receiver<PacketType<Packet>>, seq: &SeqExSync<&'a MpscTran
             }
         }
         PacketType::Payload { seq_no, reply_no, payload } => {
-            for RecvSuccess {guard, packet, send_data} in seq.receive_iter(transport, seq_no, reply_no, payload) {
+            for RecvSuccess { guard, packet, send_data } in seq.receive_all(transport, seq_no, reply_no, payload) {
                 process(guard, packet, send_data)
             }
         }

@@ -8,9 +8,7 @@ use std::{
     time::Instant,
 };
 
-use crate::{
-    Error, SeqEx, SeqNo, TransportLayer, DEFAULT_INITIAL_SEQ_NO, DEFAULT_WINDOW_CAP, DEFAULT_RESEND_INTERVAL_MS,
-};
+use crate::{Error, SeqEx, SeqNo, TransportLayer, DEFAULT_INITIAL_SEQ_NO, DEFAULT_RESEND_INTERVAL_MS, DEFAULT_WINDOW_CAP};
 
 pub struct SeqExSync<TL: TransportLayer, const CAP: usize = DEFAULT_WINDOW_CAP> {
     seq_ex: Mutex<SeqEx<TL, CAP>>,
@@ -46,6 +44,12 @@ pub struct RecvSuccess<'a, TL: TransportLayer, P: Into<TL::RecvData>, const CAP:
     pub send_data: Option<TL::SendData>,
 }
 
+pub struct ReplyIter<'a, TL: TransportLayer, const CAP: usize = DEFAULT_WINDOW_CAP> {
+    origin: Option<&'a SeqExSync<TL, CAP>>,
+    app: TL,
+    first: Option<RecvSuccess<'a, TL, TL::RecvData, CAP>>,
+}
+
 impl<TL: TransportLayer, const CAP: usize> SeqExSync<TL, CAP> {
     pub fn new(retry_interval: i64, initial_seq_no: SeqNo) -> Self {
         Self {
@@ -74,13 +78,7 @@ impl<TL: TransportLayer, const CAP: usize> SeqExSync<TL, CAP> {
         self.unblock(ret.is_ok());
         ret.map(|(reply_no, packet, send_data)| RecvSuccess { guard: ReplyGuard(self, app, reply_no), packet, send_data })
     }
-    pub fn receive_iter(
-        &self,
-        app: TL,
-        seq_no: SeqNo,
-        reply_no: Option<SeqNo>,
-        packet: TL::RecvData,
-    ) -> ReplyIter<'_, TL, CAP> {
+    pub fn receive_all(&self, app: TL, seq_no: SeqNo, reply_no: Option<SeqNo>, packet: TL::RecvData) -> ReplyIter<'_, TL, CAP> {
         if let Ok(g) = self.receive(app.clone(), seq_no, reply_no, packet) {
             ReplyIter { origin: Some(self), app, first: Some(g) }
         } else {
@@ -121,20 +119,14 @@ impl<TL: TransportLayer, const CAP: usize> SeqExSync<TL, CAP> {
         self.seq_ex.lock().unwrap()
     }
 }
-impl<TL: TransportLayer> Default for SeqExSync<TL> {
+impl<TL: TransportLayer, const CAP: usize> Default for SeqExSync<TL, CAP> {
     fn default() -> Self {
         Self::new(DEFAULT_RESEND_INTERVAL_MS, DEFAULT_INITIAL_SEQ_NO)
     }
 }
 
-pub struct ReplyIter<'a, TL: TransportLayer, const CAP: usize = DEFAULT_WINDOW_CAP> {
-    origin: Option<&'a SeqExSync<TL, CAP>>,
-    app: TL,
-    first: Option<RecvSuccess<'a, TL, TL::RecvData, CAP>>
-}
-
-impl<'a, TL: TransportLayer> Iterator for ReplyIter<'a, TL> {
-    type Item = RecvSuccess<'a, TL, TL::RecvData>;
+impl<'a, TL: TransportLayer, const CAP: usize> Iterator for ReplyIter<'a, TL, CAP> {
+    type Item = RecvSuccess<'a, TL, TL::RecvData, CAP>;
     fn next(&mut self) -> Option<Self::Item> {
         if let Some(g) = self.first.take() {
             Some(g)

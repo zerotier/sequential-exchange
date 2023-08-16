@@ -1,8 +1,4 @@
-use std::{
-    sync::{mpsc::Receiver, Mutex},
-    thread,
-    time::Duration,
-};
+use std::{sync::mpsc::Receiver, thread, time::Duration};
 
 use seq_ex::sync::{MpscTransport, PacketType, RecvSuccess, ReplyGuard, SeqExSync};
 
@@ -16,12 +12,8 @@ enum Packet {
 }
 
 fn drop_packet() -> bool {
-    static RNG: Mutex<u32> = Mutex::new(43);
-    let mut rng = RNG.lock().unwrap();
-    *rng ^= *rng << 13;
-    *rng ^= *rng >> 17;
-    *rng ^= *rng << 5;
-    *rng & 1 == 0
+    use rand_core::RngCore;
+    rand_core::OsRng.next_u32() & 1 > 0
 }
 
 fn process(_: ReplyGuard<'_, &MpscTransport<Packet>>, recv_packet: Packet, _: Option<Packet>, value: &mut f32) {
@@ -48,7 +40,7 @@ fn receive<'a>(
                     let _ = seq.receive_ack(reply_no);
                 }
                 PacketType::Payload { seq_no, reply_no, payload } => {
-                    for RecvSuccess { guard, packet, send_data } in seq.receive_iter(transport, seq_no, reply_no, payload) {
+                    for RecvSuccess { guard, packet, send_data } in seq.receive_all(transport, seq_no, reply_no, payload) {
                         process(guard, packet, send_data, value);
                     }
                 }

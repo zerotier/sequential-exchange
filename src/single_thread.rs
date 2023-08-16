@@ -1,6 +1,6 @@
-use crate::{Error, SeqEx, SeqNo, TransportLayer};
+use crate::{Error, SeqEx, SeqNo, TransportLayer, DEFAULT_WINDOW_CAP};
 
-pub struct ReplyGuard<'a, TL: TransportLayer>(&'a mut SeqEx<TL>, TL, SeqNo);
+pub struct ReplyGuard<'a, TL: TransportLayer, const CAP: usize = DEFAULT_WINDOW_CAP>(&'a mut SeqEx<TL, CAP>, TL, SeqNo);
 impl<'a, TL: TransportLayer> ReplyGuard<'a, TL> {
     /// If you need to reply more than once, say to fragment a large file, then include in your
     /// first reply some identifier, and then `send` all fragments with the same included identifier.
@@ -12,30 +12,30 @@ impl<'a, TL: TransportLayer> ReplyGuard<'a, TL> {
         core::mem::forget(self);
     }
 }
-impl<'a, TL: TransportLayer> Drop for ReplyGuard<'a, TL> {
+impl<'a, TL: TransportLayer, const CAP: usize> Drop for ReplyGuard<'a, TL, CAP> {
     fn drop(&mut self) {
         self.0.ack_raw(self.1.clone(), self.2)
     }
 }
 
-pub struct RecvSuccess<'a, TL: TransportLayer, P> {
-    pub guard: ReplyGuard<'a, TL>,
+pub struct RecvSuccess<'a, TL: TransportLayer, P, const CAP: usize = DEFAULT_WINDOW_CAP> {
+    pub guard: ReplyGuard<'a, TL, CAP>,
     pub packet: P,
     pub send_data: Option<TL::SendData>,
 }
 
-impl<TL: TransportLayer> SeqEx<TL> {
+impl<TL: TransportLayer, const CAP: usize> SeqEx<TL, CAP> {
     pub fn receive<P: Into<TL::RecvData>>(
         &mut self,
         app: TL,
         seq_no: SeqNo,
         reply_no: Option<SeqNo>,
         packet: P,
-    ) -> Result<RecvSuccess<'_, TL, P>, Error> {
+    ) -> Result<RecvSuccess<'_, TL, P, CAP>, Error> {
         self.receive_raw(app.clone(), seq_no, reply_no, packet)
             .map(|(reply_no, packet, send_data)| RecvSuccess { guard: ReplyGuard(self, app, reply_no), packet, send_data })
     }
-    pub fn pump(&mut self, app: TL) -> Result<RecvSuccess<'_, TL, TL::RecvData>, Error> {
+    pub fn pump(&mut self, app: TL) -> Result<RecvSuccess<'_, TL, TL::RecvData, CAP>, Error> {
         self.pump_raw()
             .map(|(reply_no, packet, send_data)| RecvSuccess { guard: ReplyGuard(self, app, reply_no), packet, send_data })
     }
