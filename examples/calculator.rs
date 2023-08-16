@@ -44,8 +44,8 @@ fn receive<'a>(
     while let Ok(packet) = recv.try_recv() {
         if !drop_packet() {
             match packet {
-                PacketType::EmptyReply { reply_no } => {
-                    let _ = seq.receive_empty_reply(reply_no);
+                PacketType::Ack { reply_no } => {
+                    let _ = seq.receive_ack(reply_no);
                 }
                 PacketType::Payload { seq_no, reply_no, payload } => {
                     for RecvSuccess { guard, packet, send_data } in seq.receive_iter(transport, seq_no, reply_no, payload) {

@@ -36,7 +36,7 @@ impl<'a, TL: TransportLayer, const CAP: usize> ReplyGuard<'a, TL, CAP> {
 impl<'a, TL: TransportLayer, const CAP: usize> Drop for ReplyGuard<'a, TL, CAP> {
     fn drop(&mut self) {
         let mut seq = self.0.seq_ex.lock().unwrap();
-        seq.reply_empty_raw(self.1.clone(), self.2);
+        seq.ack_raw(self.1.clone(), self.2);
     }
 }
 
@@ -108,8 +108,8 @@ impl<TL: TransportLayer, const CAP: usize> SeqExSync<TL, CAP> {
         }
     }
 
-    pub fn receive_empty_reply(&self, reply_no: SeqNo) -> Result<TL::SendData, Error> {
-        let ret = self.lock().receive_empty_reply(reply_no);
+    pub fn receive_ack(&self, reply_no: SeqNo) -> Result<TL::SendData, Error> {
+        let ret = self.lock().receive_ack(reply_no);
         self.unblock(ret.is_ok());
         ret
     }
@@ -153,7 +153,7 @@ pub enum PacketType<Payload: Clone> {
         reply_no: Option<SeqNo>,
         payload: Payload,
     },
-    EmptyReply {
+    Ack {
         reply_no: SeqNo,
     },
 }
@@ -183,7 +183,7 @@ impl<Payload: Clone> TransportLayer for &MpscTransport<Payload> {
     fn send(&mut self, seq_no: SeqNo, reply_no: Option<SeqNo>, payload: &Payload) {
         let _ = self.channel.send(PacketType::Payload { seq_no, reply_no, payload: payload.clone() });
     }
-    fn send_empty_reply(&mut self, reply_no: SeqNo) {
-        let _ = self.channel.send(PacketType::EmptyReply { reply_no });
+    fn send_ack(&mut self, reply_no: SeqNo) {
+        let _ = self.channel.send(PacketType::Ack { reply_no });
     }
 }

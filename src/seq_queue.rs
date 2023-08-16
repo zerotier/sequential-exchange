@@ -64,7 +64,7 @@ pub struct SeqEx<TL: TransportLayer, const CAP: usize = DEFAULT_WINDOW_CAP> {
     concurrent_replies: [SeqNo; CAP],
     /// The total number of concurrent replies being processed. When a packet is received, a reply
     /// number is issued for that packet. That reply number reserves resources for itself, so that
-    /// when `reply_raw` or `reply_empty_raw` are called with it, they are guaranteed not to fail.
+    /// when `reply_raw` or `ack_raw` are called with it, they are guaranteed not to fail.
     /// To accomplish this we must track all issued reply numbers.
     concurrent_replies_total: usize,
 }
@@ -158,7 +158,7 @@ impl<TL: TransportLayer, const CAP: usize> SeqEx<TL, CAP> {
     ///
     /// If the return value is `Err` the queue is full and the packet will not be sent.
     /// The caller must either cancel sending, abort the connection, or wait until a call to
-    /// `receive` or `receive_empty_reply` returns `Ok` and try again.
+    /// `receive` or `receive_ack` returns `Ok` and try again.
     ///
     /// If `Ok` is returned then the packet was successfully sent.
     ///
@@ -209,13 +209,13 @@ impl<TL: TransportLayer, const CAP: usize> SeqEx<TL, CAP> {
         let is_next = normalized_seq_no == 0;
         if is_below_range {
             // If it is below the range, that means the packet has been received twice.
-            // For every received packet we either send a normal reply or send an empty reply.
+            // For every received packet we either send a normal reply or send an ack.
             // If the application sent a normal reply in response to this packet previously, and
             // that reply has not been acknowledged, then arg `seq_no` will be in the send window,
             // and if the application is still deciding what to reply with, it will be in the
             // concurrent replies array.
             // If either are the case then we know we will eventually send a reply to the packet.
-            // If neither are the case then we must send an empty reply so the remote peer can stop
+            // If neither are the case then we must send an ack so the remote peer can stop
             // resending the packet.
             for entry in self.send_window.iter().flatten() {
                 if entry.reply_no == Some(seq_no) {
@@ -227,7 +227,7 @@ impl<TL: TransportLayer, const CAP: usize> SeqEx<TL, CAP> {
                     return Err(Error::OutOfSequence);
                 }
             }
-            app.send_empty_reply(seq_no);
+            app.send_ack(seq_no);
             return Err(Error::OutOfSequence);
         } else if is_above_range {
             return Err(Error::OutOfSequence);
@@ -270,7 +270,7 @@ impl<TL: TransportLayer, const CAP: usize> SeqEx<TL, CAP> {
             }
         }
     }
-    pub fn receive_empty_reply(&mut self, reply_no: SeqNo) -> Result<TL::SendData, Error> {
+    pub fn receive_ack(&mut self, reply_no: SeqNo) -> Result<TL::SendData, Error> {
         let slot = self.send_window_slot_mut(reply_no);
         if slot.as_ref().map_or(false, |e| e.seq_no == reply_no) {
             let entry = slot.take().unwrap();
@@ -352,11 +352,11 @@ impl<TL: TransportLayer, const CAP: usize> SeqEx<TL, CAP> {
             app.send(entry.seq_no, entry.reply_no, &entry.data);
         }
     }
-    pub fn reply_empty_raw(&mut self, mut app: TL, reply_no: SeqNo) {
+    pub fn ack_raw(&mut self, mut app: TL, reply_no: SeqNo) {
         if self.remove_reservation(reply_no) {
-            // Empty replies are only sent once. There is code in `receive_raw` to handle resending
-            // an empty reply in the event that the first one here was dropped by the network.
-            app.send_empty_reply(reply_no);
+            // Acks are only sent once. There is code in `receive_raw` to handle resending
+            // an ack in the event that the first one here was dropped by the network.
+            app.send_ack(reply_no);
         }
     }
     fn remove_reservation(&mut self, reply_no: SeqNo) -> bool {

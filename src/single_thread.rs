@@ -14,7 +14,7 @@ impl<'a, TL: TransportLayer> ReplyGuard<'a, TL> {
 }
 impl<'a, TL: TransportLayer> Drop for ReplyGuard<'a, TL> {
     fn drop(&mut self) {
-        self.0.reply_empty_raw(self.1.clone(), self.2)
+        self.0.ack_raw(self.1.clone(), self.2)
     }
 }
 

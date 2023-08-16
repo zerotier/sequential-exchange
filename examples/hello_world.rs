@@ -39,8 +39,8 @@ fn process(guard: ReplyGuard<'_, &MpscTransport<Packet>>, recv_packet: Packet, s
 
 fn receive<'a>(recv: &Receiver<PacketType<Packet>>, seq: &SeqExSync<&'a MpscTransport<Packet>>, transport: &'a MpscTransport<Packet>) {
     match recv.recv().unwrap() {
-        PacketType::EmptyReply { reply_no } => {
-            let result = seq.receive_empty_reply(reply_no);
+        PacketType::Ack { reply_no } => {
+            let result = seq.receive_ack(reply_no);
             if let Ok(Exclamation) = result {
                 // Our Hello World exchange ends right here.
                 print!("\n");
