@@ -14,11 +14,11 @@ pub struct SeqExSync<SendData, RecvData, const CAP: usize = DEFAULT_WINDOW_CAP> 
     send_block: Condvar,
 }
 
-pub struct ReplyGuard<'a, TL: TransportLayer<SendData>, SendData, RecvData, const CAP: usize = DEFAULT_WINDOW_CAP>(
-    &'a SeqExSync<SendData, RecvData, CAP>,
-    TL,
-    SeqNo,
-);
+pub struct ReplyGuard<'a, TL: TransportLayer<SendData>, SendData, RecvData, const CAP: usize = DEFAULT_WINDOW_CAP> {
+    origin: &'a SeqExSync<SendData, RecvData, CAP>,
+    app: TL,
+    reply_no: SeqNo,
+}
 impl<'a, TL: TransportLayer<SendData>, SendData, RecvData, const CAP: usize> ReplyGuard<'a, TL, SendData, RecvData, CAP> {
     /// If you need to reply more than once, say to fragment a large file, then include in your
     /// first reply some identifier, and then `send` all fragments with the same included identifier.
@@ -26,15 +26,21 @@ impl<'a, TL: TransportLayer<SendData>, SendData, RecvData, const CAP: usize> Rep
     /// and since each fragment will be received in order it will be trivial for them to reconstruct
     /// the original file.
     pub fn reply(self, packet_data: SendData) {
-        let mut seq = self.0.lock();
-        seq.reply_raw(self.1.clone(), self.2, packet_data);
+        let mut seq = self.origin.lock();
+        seq.reply_raw(self.app.clone(), self.reply_no, packet_data);
+        core::mem::forget(self);
+    }
+    pub fn reply_with(self, packet_data: impl FnOnce(SeqNo, SeqNo) -> SendData) {
+        let mut seq = self.origin.lock();
+        let seq_no = seq.seq_no();
+        seq.reply_raw(self.app.clone(), self.reply_no, packet_data(seq_no, self.reply_no));
         core::mem::forget(self);
     }
 }
 impl<'a, TL: TransportLayer<SendData>, SendData, RecvData, const CAP: usize> Drop for ReplyGuard<'a, TL, SendData, RecvData, CAP> {
     fn drop(&mut self) {
-        let mut seq = self.0.lock();
-        seq.ack_raw(self.1.clone(), self.2);
+        let mut seq = self.origin.lock();
+        seq.ack_raw(self.app.clone(), self.reply_no);
     }
 }
 
@@ -84,7 +90,11 @@ impl<SendData, RecvData, const CAP: usize> SeqExSync<SendData, RecvData, CAP> {
         if seq.1 > 0 && ret.is_ok() {
             self.send_block.notify_one();
         }
-        ret.map(|(reply_no, packet, send_data)| RecvSuccess { guard: ReplyGuard(self, app, reply_no), packet, send_data })
+        ret.map(|(reply_no, packet, send_data)| RecvSuccess {
+            guard: ReplyGuard { origin: self, app, reply_no },
+            packet,
+            send_data,
+        })
     }
     pub fn pump<TL: TransportLayer<SendData>>(&self, app: TL) -> Result<RecvSuccess<'_, TL, RecvData, SendData, RecvData, CAP>, Error> {
         let mut seq = self.seq_ex.lock().unwrap();
@@ -92,7 +102,11 @@ impl<SendData, RecvData, const CAP: usize> SeqExSync<SendData, RecvData, CAP> {
         if seq.1 > 0 && ret.is_ok() {
             self.send_block.notify_one();
         }
-        ret.map(|(reply_no, packet, send_data)| RecvSuccess { guard: ReplyGuard(self, app, reply_no), packet, send_data })
+        ret.map(|(reply_no, packet, send_data)| RecvSuccess {
+            guard: ReplyGuard { origin: self, app, reply_no },
+            packet,
+            send_data,
+        })
     }
     pub fn receive_all<TL: TransportLayer<SendData>>(
         &self,
@@ -111,14 +125,31 @@ impl<SendData, RecvData, const CAP: usize> SeqExSync<SendData, RecvData, CAP> {
         let mut seq = self.lock();
         seq.try_send(app, packet_data)
     }
-    pub fn send<TL: TransportLayer<SendData>>(&self, app: TL, mut packet_data: SendData) {
-        let mut seq = self.seq_ex.lock().unwrap();
+    fn send_inner<TL: TransportLayer<SendData>>(
+        &self,
+        mut seq: MutexGuard<'_, (SeqEx<SendData, RecvData, CAP>, usize)>,
+        app: TL,
+        mut packet_data: SendData,
+    ) {
         while let Err(p) = seq.0.try_send(app.clone(), packet_data) {
             packet_data = p;
             seq.1 += 1;
             seq = self.send_block.wait(seq).unwrap();
             seq.1 -= 1;
         }
+    }
+    pub fn send<TL: TransportLayer<SendData>>(&self, app: TL, packet_data: SendData) {
+        self.send_inner(self.seq_ex.lock().unwrap(), app, packet_data)
+    }
+    pub fn try_send_with<TL: TransportLayer<SendData>>(&self, app: TL, packet_data: impl FnOnce(SeqNo) -> SendData) -> Result<(), SendData> {
+        let mut seq = self.lock();
+        let seq_no = seq.seq_no();
+        seq.try_send(app, packet_data(seq_no))
+    }
+    pub fn send_with<TL: TransportLayer<SendData>>(&self, app: TL, packet_data: impl FnOnce(SeqNo) -> SendData) {
+        let seq = self.seq_ex.lock().unwrap();
+        let seq_no = seq.0.seq_no();
+        self.send_inner(seq, app, packet_data(seq_no))
     }
 
     pub fn receive_ack(&self, reply_no: SeqNo) -> Result<SendData, Error> {
