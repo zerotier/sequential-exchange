@@ -201,7 +201,7 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
     }
 
     /// If this returns `Ok` then `try_send` might succeed on next call.
-    pub fn receive_raw<P: Into<RecvData>>(
+    pub fn receive_direct<P: Into<RecvData>>(
         &mut self,
         seq_no: SeqNo,
         reply_no: Option<SeqNo>,
@@ -333,7 +333,7 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
     /// and since each fragment will be received in order it will be trivial for them to reconstruct
     /// the original file.
     #[must_use]
-    pub fn reply_raw(&mut self, reply_no: SeqNo, packet_data: SendData, current_time: i64) -> Option<Payload<'_, SendData>> {
+    pub fn reply_direct(&mut self, reply_no: SeqNo, packet_data: SendData, current_time: i64) -> Option<Payload<'_, SendData>> {
         if self.remove_reservation(reply_no) {
             let seq_no = self.next_send_seq_no;
             self.next_send_seq_no = self.next_send_seq_no.wrapping_add(1);
@@ -356,14 +356,8 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
             None
         }
     }
-    pub fn ack_raw(&mut self, reply_no: SeqNo) -> Option<SeqNo> {
-        if self.remove_reservation(reply_no) {
-            // Acks are only sent once. There is code in `receive_raw` to handle resending
-            // an ack in the event that the first one here was dropped by the network.
-            Some(reply_no)
-        } else {
-            None
-        }
+    pub fn ack_direct(&mut self, reply_no: SeqNo) -> bool {
+        self.remove_reservation(reply_no)
     }
     fn remove_reservation(&mut self, reply_no: SeqNo) -> bool {
         for i in 0..self.concurrent_replies_total {
