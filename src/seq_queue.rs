@@ -156,11 +156,11 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
     }
     /// Sends the given packet to the remote peer and adds it to the send window.
     ///
+    /// If `Ok` is returned then the packet was successfully sent.
+    ///
     /// If the return value is `Err` the queue is full and the packet will not be sent.
     /// The caller must either cancel sending, abort the connection, or wait until a call to
-    /// `receive` or `receive_ack` returns `Ok` and try again.
-    ///
-    /// If `Ok` is returned then the packet was successfully sent.
+    /// `receive`, `receive_ack` or `pump` returns `Ok` and try again.
     ///
     /// `packet_data` should contain both the packet to be sent as well as any local metadata the
     /// caller wants to store with the packet. This metadata allows the exchange to be stateful.
@@ -171,7 +171,7 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
     /// user would like. However this choice of units must be consistent with the units of the
     /// `retry_interval`. `current_time` does not have to be monotonically increasing.
     #[must_use = "The queue might be full causing the packet to not be sent"]
-    pub fn try_send(&mut self, mut app: impl TransportLayer<SendData = SendData>, packet_data: SendData) -> Result<(), SendData> {
+    pub fn try_send(&mut self, mut app: impl TransportLayer<SendData>, packet_data: SendData) -> Result<(), SendData> {
         if self.is_full() {
             return Err(packet_data);
         }
@@ -192,9 +192,10 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
         Ok(())
     }
 
+    /// If this returns `Ok` then `try_send` might succeed on next call.
     pub fn receive_raw<P: Into<RecvData>>(
         &mut self,
-        mut app: impl TransportLayer<SendData = SendData>,
+        mut app: impl TransportLayer<SendData>,
         seq_no: SeqNo,
         reply_no: Option<SeqNo>,
         packet: P,
@@ -270,14 +271,9 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
             }
         }
     }
+    /// If this returns `Ok` then `try_send` might succeed on next call.
     pub fn receive_ack(&mut self, reply_no: SeqNo) -> Result<SendData, Error> {
-        let slot = self.send_window_slot_mut(reply_no);
-        if slot.as_ref().map_or(false, |e| e.seq_no == reply_no) {
-            let entry = slot.take().unwrap();
-            Ok(entry.data)
-        } else {
-            Err(Error::OutOfSequence)
-        }
+        self.take_send(reply_no).ok_or(Error::OutOfSequence)
     }
 
     fn is_full_inner(&self, reserve_one: bool) -> bool {
@@ -301,6 +297,7 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
             None
         }
     }
+    /// If this returns `Ok` then `try_send` might succeed on next call.
     pub fn pump_raw(&mut self) -> Result<(SeqNo, RecvData, Option<SendData>), Error> {
         let next_seq_no = self.pre_recv_seq_no.wrapping_add(1);
         let i = next_seq_no as usize % self.recv_window.len();
@@ -329,7 +326,7 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
     /// The identifier will tell the remote peer which packets contain fragments of the file,
     /// and since each fragment will be received in order it will be trivial for them to reconstruct
     /// the original file.
-    pub fn reply_raw(&mut self, mut app: impl TransportLayer<SendData = SendData>, reply_no: SeqNo, packet_data: SendData) {
+    pub fn reply_raw(&mut self, mut app: impl TransportLayer<SendData>, reply_no: SeqNo, packet_data: SendData) {
         if self.remove_reservation(reply_no) {
             let seq_no = self.next_send_seq_no;
             self.next_send_seq_no = self.next_send_seq_no.wrapping_add(1);
@@ -352,7 +349,7 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
             app.send(entry.seq_no, entry.reply_no, &entry.data);
         }
     }
-    pub fn ack_raw(&mut self, mut app: impl TransportLayer<SendData = SendData>, reply_no: SeqNo) {
+    pub fn ack_raw(&mut self, mut app: impl TransportLayer<SendData>, reply_no: SeqNo) {
         if self.remove_reservation(reply_no) {
             // Acks are only sent once. There is code in `receive_raw` to handle resending
             // an ack in the event that the first one here was dropped by the network.
@@ -371,7 +368,7 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
         false
     }
 
-    pub fn service(&mut self, mut app: impl TransportLayer<SendData = SendData>) -> i64 {
+    pub fn service(&mut self, mut app: impl TransportLayer<SendData>) -> i64 {
         let current_time = app.time();
         let next_interval = current_time + self.resend_interval;
         let mut next_activity = i64::MAX;

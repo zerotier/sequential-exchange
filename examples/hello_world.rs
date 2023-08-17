@@ -69,3 +69,8 @@ fn main() {
     receive(&recv1, &seq1, &transport1);
     receive(&recv2, &seq2, &transport2);
 }
+
+#[test]
+fn test() {
+    main()
+}

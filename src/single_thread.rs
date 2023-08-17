@@ -1,11 +1,11 @@
 use crate::{Error, SeqEx, SeqNo, TransportLayer, DEFAULT_WINDOW_CAP};
 
-pub struct ReplyGuard<'a, TL: TransportLayer<SendData = SendData>, SendData, RecvData, const CAP: usize = DEFAULT_WINDOW_CAP>(
+pub struct ReplyGuard<'a, TL: TransportLayer<SendData>, SendData, RecvData, const CAP: usize = DEFAULT_WINDOW_CAP>(
     &'a mut SeqEx<SendData, RecvData, CAP>,
     TL,
     SeqNo,
 );
-impl<'a, TL: TransportLayer<SendData = SendData>, SendData, RecvData, const CAP: usize> ReplyGuard<'a, TL, SendData, RecvData, CAP> {
+impl<'a, TL: TransportLayer<SendData>, SendData, RecvData, const CAP: usize> ReplyGuard<'a, TL, SendData, RecvData, CAP> {
     /// If you need to reply more than once, say to fragment a large file, then include in your
     /// first reply some identifier, and then `send` all fragments with the same included identifier.
     /// The identifier will tell the remote peer which packets contain fragments of the file,
@@ -16,20 +16,20 @@ impl<'a, TL: TransportLayer<SendData = SendData>, SendData, RecvData, const CAP:
         core::mem::forget(self);
     }
 }
-impl<'a, TL: TransportLayer<SendData = SendData>, SendData, RecvData, const CAP: usize> Drop for ReplyGuard<'a, TL, SendData, RecvData, CAP> {
+impl<'a, TL: TransportLayer<SendData>, SendData, RecvData, const CAP: usize> Drop for ReplyGuard<'a, TL, SendData, RecvData, CAP> {
     fn drop(&mut self) {
         self.0.ack_raw(self.1.clone(), self.2)
     }
 }
 
-pub struct RecvSuccess<'a, TL: TransportLayer<SendData = SendData>, P: Into<RecvData>, SendData, RecvData, const CAP: usize = DEFAULT_WINDOW_CAP> {
+pub struct RecvSuccess<'a, TL: TransportLayer<SendData>, P: Into<RecvData>, SendData, RecvData, const CAP: usize = DEFAULT_WINDOW_CAP> {
     pub guard: ReplyGuard<'a, TL, SendData, RecvData, CAP>,
     pub packet: P,
     pub send_data: Option<SendData>,
 }
 
 impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
-    pub fn receive<TL: TransportLayer<SendData = SendData>, P: Into<RecvData>>(
+    pub fn receive<TL: TransportLayer<SendData>, P: Into<RecvData>>(
         &mut self,
         app: TL,
         seq_no: SeqNo,
@@ -39,10 +39,7 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
         self.receive_raw(app.clone(), seq_no, reply_no, packet)
             .map(|(reply_no, packet, send_data)| RecvSuccess { guard: ReplyGuard(self, app, reply_no), packet, send_data })
     }
-    pub fn pump<TL: TransportLayer<SendData = SendData>>(
-        &mut self,
-        app: TL,
-    ) -> Result<RecvSuccess<'_, TL, RecvData, SendData, RecvData, CAP>, Error> {
+    pub fn pump<TL: TransportLayer<SendData>>(&mut self, app: TL) -> Result<RecvSuccess<'_, TL, RecvData, SendData, RecvData, CAP>, Error> {
         self.pump_raw()
             .map(|(reply_no, packet, send_data)| RecvSuccess { guard: ReplyGuard(self, app, reply_no), packet, send_data })
     }

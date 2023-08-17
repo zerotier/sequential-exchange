@@ -72,3 +72,8 @@ fn main() {
     }
     assert_eq!(value, remote_value);
 }
+
+#[test]
+fn test() {
+    main()
+}

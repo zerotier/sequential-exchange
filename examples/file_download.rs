@@ -36,9 +36,7 @@ struct Peer {
     receiver: Receiver<Vec<u8>>,
 }
 
-impl TransportLayer for &Transport {
-    type SendData = Packet;
-
+impl TransportLayer<Packet> for &Transport {
     fn time(&mut self) -> i64 {
         self.time.elapsed().as_millis() as i64
     }
@@ -129,13 +127,13 @@ fn receive(peer: &Peer) {
 
 fn main() {
     let mut filesystem2 = HashMap::new();
-    let mut file = Vec::from([0u8; 1 << 16]);
+    let mut file = vec![0; 1 << 16];
     OsRng.fill_bytes(&mut file);
     filesystem2.insert("File1".to_string(), file);
-    let mut file = Vec::from([0u8; 1 << 18]);
+    let mut file = vec![0; 1 << 18];
     OsRng.fill_bytes(&mut file);
     filesystem2.insert("File2".to_string(), file);
-    let mut file = Vec::from([0u8; 1 << 20]);
+    let mut file = vec![0; 1 << 20];
     OsRng.fill_bytes(&mut file);
     filesystem2.insert("File3".to_string(), file);
 
@@ -168,4 +166,9 @@ fn main() {
     }
 
     assert_eq!(peer1.filesystem.read().unwrap().deref(), peer2.filesystem.read().unwrap().deref());
+}
+
+#[test]
+fn test() {
+    main()
 }
