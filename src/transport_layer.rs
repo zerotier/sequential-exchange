@@ -8,8 +8,6 @@ use crate::SeqNo;
 /// they are most easily implemented as some combination of custom enums, `Vec<u8>` and `Arc<[u8]>`.
 pub trait TransportLayer<SendData>: Clone {
     fn time(&mut self) -> i64;
-    #[allow(unused)]
-    fn update_service_time(&mut self, timestamp: i64, current_time: i64) {}
 
     fn send(&mut self, seq_no: SeqNo, reply_no: Option<SeqNo>, payload: &SendData);
     fn send_ack(&mut self, reply_no: SeqNo);

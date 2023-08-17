@@ -183,7 +183,6 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
         let next_resend_time = current_time + self.resend_interval;
         if self.next_service_timestamp > next_resend_time {
             self.next_service_timestamp = next_resend_time;
-            app.update_service_time(next_resend_time, current_time);
         }
         let slot = self.send_window_slot_mut(seq_no);
         debug_assert!(slot.is_none());
@@ -336,7 +335,6 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
             let next_resend_time = current_time + self.resend_interval;
             if self.next_service_timestamp > next_resend_time {
                 self.next_service_timestamp = next_resend_time;
-                app.update_service_time(next_resend_time, current_time);
             }
             let slot = self.send_window_slot_mut(seq_no);
             debug_assert!(slot.is_none());
@@ -382,7 +380,6 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
                 next_activity = next_activity.min(entry.next_resend_time);
             }
             self.next_service_timestamp = next_activity;
-            app.update_service_time(next_activity, current_time);
             next_activity - current_time
         } else {
             self.next_service_timestamp - current_time
