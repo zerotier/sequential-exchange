@@ -127,13 +127,13 @@ fn receive(peer: &Peer) {
 
 fn main() {
     let mut filesystem2 = HashMap::new();
-    let mut file = vec![0; 1 << 14];
-    OsRng.fill_bytes(&mut file);
-    filesystem2.insert("File1".to_string(), file);
     let mut file = vec![0; 1 << 16];
     OsRng.fill_bytes(&mut file);
-    filesystem2.insert("File2".to_string(), file);
+    filesystem2.insert("File1".to_string(), file);
     let mut file = vec![0; 1 << 18];
+    OsRng.fill_bytes(&mut file);
+    filesystem2.insert("File2".to_string(), file);
+    let mut file = vec![0; 1 << 20];
     OsRng.fill_bytes(&mut file);
     filesystem2.insert("File3".to_string(), file);
 
@@ -157,7 +157,7 @@ fn main() {
     peer1.seqex.send(&peer1.transport, Packet::RequestFile { filename: "File3".to_string() });
     peer1.seqex.send(&peer1.transport, Packet::RequestFile { filename: "File2".to_string() });
 
-    for _ in 0..3000 {
+    for _ in 0..300 {
         receive(&peer1);
         receive(&peer2);
         thread::sleep(Duration::from_millis(1));

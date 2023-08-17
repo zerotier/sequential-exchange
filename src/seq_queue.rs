@@ -378,9 +378,8 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
                 if entry.next_resend_time <= current_time {
                     entry.next_resend_time = next_resend_time;
                     app.send(entry.seq_no, entry.reply_no, &entry.data);
-                } else {
-                    next_activity = next_activity.min(entry.next_resend_time);
                 }
+                next_activity = next_activity.min(entry.next_resend_time);
             }
             self.next_service_timestamp = next_activity;
             app.update_service_time(next_activity, current_time);
