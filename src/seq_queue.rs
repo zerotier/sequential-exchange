@@ -34,8 +34,6 @@
 //! ## Examples
 //!
 
-use crate::TransportLayer;
-
 /// A 32-bit sequence number. Packets transported with SEP are expected to contain at least one
 /// sequence number, and sometimes two.
 /// All packets will either have a seq_no, a reply_no, or both.
@@ -92,6 +90,13 @@ pub enum Error {
     /// The Send Window is currently full. The received packet cannot be processed right now because
     /// it could cause the send window to overflow. No action needs to be taken by the caller.
     WindowIsFull,
+    ResendAck(SeqNo),
+}
+
+pub struct Payload<'a, SendData> {
+    pub seq_no: SeqNo,
+    pub reply_no: Option<SeqNo>,
+    pub data: &'a SendData,
 }
 
 /// An iterator over all packets in the send window. It will iterate over all packets currently
@@ -108,6 +113,11 @@ pub struct Iter<'a, SendData>(core::slice::Iter<'a, Option<SendEntry<SendData>>>
 /// if the remote peer will see the modified packet. For this reason it is not recommended to modify
 /// the packet.
 pub struct IterMut<'a, SendData>(core::slice::IterMut<'a, Option<SendEntry<SendData>>>);
+
+pub struct ServiceIter {
+    idx: usize,
+    next_time: i64,
+}
 
 impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
     /// Creates a new instance of `SeqEx` for a new remote peer.
@@ -172,14 +182,13 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
     /// user would like. However this choice of units must be consistent with the units of the
     /// `retry_interval`. `current_time` does not have to be monotonically increasing.
     #[must_use = "The queue might be full causing the packet to not be sent"]
-    pub fn try_send(&mut self, mut app: impl TransportLayer<SendData>, packet_data: SendData) -> Result<(), SendData> {
+    pub fn try_send(&mut self, packet_data: SendData, current_time: i64) -> Result<Payload<'_, SendData>, SendData> {
         if self.is_full() {
             return Err(packet_data);
         }
         let seq_no = self.next_send_seq_no;
         self.next_send_seq_no = self.next_send_seq_no.wrapping_add(1);
 
-        let current_time = app.time();
         let next_resend_time = current_time + self.resend_interval;
         if self.next_service_timestamp > next_resend_time {
             self.next_service_timestamp = next_resend_time;
@@ -188,14 +197,12 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
         debug_assert!(slot.is_none());
         let entry = slot.insert(SendEntry { seq_no, reply_no: None, next_resend_time, data: packet_data });
 
-        app.send(entry.seq_no, entry.reply_no, &entry.data);
-        Ok(())
+        Ok(Payload { seq_no: entry.seq_no, reply_no: entry.reply_no, data: &entry.data })
     }
 
     /// If this returns `Ok` then `try_send` might succeed on next call.
     pub fn receive_raw<P: Into<RecvData>>(
         &mut self,
-        mut app: impl TransportLayer<SendData>,
         seq_no: SeqNo,
         reply_no: Option<SeqNo>,
         packet: P,
@@ -228,8 +235,7 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
                     return Err(Error::OutOfSequence);
                 }
             }
-            app.send_ack(seq_no);
-            return Err(Error::OutOfSequence);
+            return Err(Error::ResendAck(seq_no));
         } else if is_above_range {
             return Err(Error::OutOfSequence);
         }
@@ -326,12 +332,12 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
     /// The identifier will tell the remote peer which packets contain fragments of the file,
     /// and since each fragment will be received in order it will be trivial for them to reconstruct
     /// the original file.
-    pub fn reply_raw(&mut self, mut app: impl TransportLayer<SendData>, reply_no: SeqNo, packet_data: SendData) {
+    #[must_use]
+    pub fn reply_raw(&mut self, reply_no: SeqNo, packet_data: SendData, current_time: i64) -> Option<Payload<'_, SendData>> {
         if self.remove_reservation(reply_no) {
             let seq_no = self.next_send_seq_no;
             self.next_send_seq_no = self.next_send_seq_no.wrapping_add(1);
 
-            let current_time = app.time();
             let next_resend_time = current_time + self.resend_interval;
             if self.next_service_timestamp > next_resend_time {
                 self.next_service_timestamp = next_resend_time;
@@ -345,14 +351,18 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
                 data: packet_data,
             });
 
-            app.send(entry.seq_no, entry.reply_no, &entry.data);
+            Some(Payload { seq_no: entry.seq_no, reply_no: entry.reply_no, data: &entry.data })
+        } else {
+            None
         }
     }
-    pub fn ack_raw(&mut self, mut app: impl TransportLayer<SendData>, reply_no: SeqNo) {
+    pub fn ack_raw(&mut self, reply_no: SeqNo) -> Option<SeqNo> {
         if self.remove_reservation(reply_no) {
             // Acks are only sent once. There is code in `receive_raw` to handle resending
             // an ack in the event that the first one here was dropped by the network.
-            app.send_ack(reply_no);
+            Some(reply_no)
+        } else {
+            None
         }
     }
     fn remove_reservation(&mut self, reply_no: SeqNo) -> bool {
@@ -367,24 +377,27 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
         false
     }
 
-    pub fn service(&mut self, mut app: impl TransportLayer<SendData>) -> i64 {
-        let current_time = app.time();
-        let real_interval = if self.next_service_timestamp <= current_time {
-            let next_resend_time = current_time + self.resend_interval;
-            let mut next_activity = i64::MAX;
-            for entry in self.send_window.iter_mut().flatten() {
-                if entry.next_resend_time <= current_time {
-                    entry.next_resend_time = next_resend_time;
-                    app.send(entry.seq_no, entry.reply_no, &entry.data);
+    pub fn service<'a>(&'a mut self, current_time: i64, iter: &mut Option<ServiceIter>) -> Option<Payload<'a, SendData>> {
+        if self.next_service_timestamp <= current_time {
+            let iter = iter.get_or_insert(ServiceIter {
+                idx: 0,
+                next_time: i64::MAX,
+            });
+            while let Some(entry) = self.send_window.get(iter.idx) {
+                iter.idx += 1;
+                if let Some(entry) = entry {
+                    if entry.next_resend_time <= current_time {
+                        entry.next_resend_time = current_time + self.resend_interval;
+                        iter.next_time = iter.next_time.min(entry.next_resend_time);
+                        return Some(Payload { seq_no: entry.seq_no, reply_no: entry.reply_no, data: &entry.data });
+                    } else {
+                        iter.next_time = iter.next_time.min(entry.next_resend_time);
+                    }
                 }
-                next_activity = next_activity.min(entry.next_resend_time);
             }
-            self.next_service_timestamp = next_activity;
-            next_activity - current_time
-        } else {
-            self.next_service_timestamp - current_time
-        };
-        self.resend_interval.min(real_interval)
+            self.next_service_timestamp = iter.next_time;
+        }
+        None
     }
 
     pub fn iter(&self) -> Iter<'_, SendData> {
@@ -427,10 +440,6 @@ macro_rules! iterator {
                     }
                 }
                 None
-            }
-
-            fn size_hint(&self) -> (usize, Option<usize>) {
-                (0, Some(self.0.len()))
             }
         }
         impl<'a, SendData> DoubleEndedIterator for $iter<'a, SendData> {

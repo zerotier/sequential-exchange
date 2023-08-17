@@ -1,4 +1,4 @@
-use crate::{Error, SeqEx, SeqNo, TransportLayer, DEFAULT_WINDOW_CAP};
+use crate::{Error, SeqEx, SeqNo, TransportLayer, DEFAULT_WINDOW_CAP, Payload};
 
 pub struct ReplyGuard<'a, TL: TransportLayer<SendData>, SendData, RecvData, const CAP: usize = DEFAULT_WINDOW_CAP>(
     &'a mut SeqEx<SendData, RecvData, CAP>,
@@ -11,14 +11,18 @@ impl<'a, TL: TransportLayer<SendData>, SendData, RecvData, const CAP: usize> Rep
     /// The identifier will tell the remote peer which packets contain fragments of the file,
     /// and since each fragment will be received in order it will be trivial for them to reconstruct
     /// the original file.
-    pub fn reply(self, packet_data: SendData) {
-        self.0.reply_raw(self.1.clone(), self.2, packet_data);
+    pub fn reply(mut self, packet_data: SendData) {
+        if let Some(Payload { seq_no, reply_no, data }) = self.0.reply_raw(self.2, packet_data, self.1.time()) {
+            self.1.send(seq_no, reply_no, data)
+        }
         core::mem::forget(self);
     }
 }
 impl<'a, TL: TransportLayer<SendData>, SendData, RecvData, const CAP: usize> Drop for ReplyGuard<'a, TL, SendData, RecvData, CAP> {
     fn drop(&mut self) {
-        self.0.ack_raw(self.1.clone(), self.2)
+        if let Some(reply_no) = self.0.ack_raw(self.2) {
+            self.1.send_ack(reply_no)
+        }
     }
 }
 
@@ -36,7 +40,7 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
         reply_no: Option<SeqNo>,
         packet: P,
     ) -> Result<RecvSuccess<'_, TL, P, SendData, RecvData, CAP>, Error> {
-        self.receive_raw(app.clone(), seq_no, reply_no, packet)
+        self.receive_raw(seq_no, reply_no, packet)
             .map(|(reply_no, packet, send_data)| RecvSuccess { guard: ReplyGuard(self, app, reply_no), packet, send_data })
     }
     pub fn pump<TL: TransportLayer<SendData>>(&mut self, app: TL) -> Result<RecvSuccess<'_, TL, RecvData, SendData, RecvData, CAP>, Error> {

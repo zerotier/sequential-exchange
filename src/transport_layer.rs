@@ -9,6 +9,6 @@ use crate::SeqNo;
 pub trait TransportLayer<SendData>: Clone {
     fn time(&mut self) -> i64;
 
-    fn send(&mut self, seq_no: SeqNo, reply_no: Option<SeqNo>, payload: &SendData);
+    fn send(&mut self, seq_no: SeqNo, reply_no: Option<SeqNo>, data: &SendData);
     fn send_ack(&mut self, reply_no: SeqNo);
 }

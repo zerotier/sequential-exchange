@@ -7,7 +7,7 @@ use std::{
     time::Instant,
 };
 
-use crate::{Error, SeqEx, SeqNo, TransportLayer, DEFAULT_INITIAL_SEQ_NO, DEFAULT_RESEND_INTERVAL_MS, DEFAULT_WINDOW_CAP};
+use crate::{Error, SeqEx, SeqNo, TransportLayer, DEFAULT_INITIAL_SEQ_NO, DEFAULT_RESEND_INTERVAL_MS, DEFAULT_WINDOW_CAP, Payload};
 
 pub struct SeqExSync<SendData, RecvData, const CAP: usize = DEFAULT_WINDOW_CAP> {
     seq_ex: Mutex<(SeqEx<SendData, RecvData, CAP>, usize)>,
@@ -25,22 +25,24 @@ impl<'a, TL: TransportLayer<SendData>, SendData, RecvData, const CAP: usize> Rep
     /// The identifier will tell the remote peer which packets contain fragments of the file,
     /// and since each fragment will be received in order it will be trivial for them to reconstruct
     /// the original file.
-    pub fn reply(self, packet_data: SendData) {
-        let mut seq = self.origin.lock();
-        seq.reply_raw(self.app.clone(), self.reply_no, packet_data);
-        core::mem::forget(self);
+    pub fn reply(mut self, packet_data: SendData) {
+        self.reply_with(|_, _| packet_data)
     }
-    pub fn reply_with(self, packet_data: impl FnOnce(SeqNo, SeqNo) -> SendData) {
+    pub fn reply_with(mut self, packet_data: impl FnOnce(SeqNo, SeqNo) -> SendData) {
         let mut seq = self.origin.lock();
         let seq_no = seq.seq_no();
-        seq.reply_raw(self.app.clone(), self.reply_no, packet_data(seq_no, self.reply_no));
+        if let Some(Payload { seq_no, reply_no, data }) = seq.reply_raw(self.reply_no, packet_data(seq_no, self.reply_no), self.app.time()) {
+            self.app.send(seq_no, reply_no, data)
+        }
         core::mem::forget(self);
     }
 }
 impl<'a, TL: TransportLayer<SendData>, SendData, RecvData, const CAP: usize> Drop for ReplyGuard<'a, TL, SendData, RecvData, CAP> {
     fn drop(&mut self) {
         let mut seq = self.origin.lock();
-        seq.ack_raw(self.app.clone(), self.reply_no);
+        if let Some(reply_no) = seq.ack_raw(self.reply_no) {
+            self.app.send_ack(reply_no)
+        }
     }
 }
 
@@ -80,13 +82,16 @@ impl<SendData, RecvData, const CAP: usize> SeqExSync<SendData, RecvData, CAP> {
 
     pub fn receive<TL: TransportLayer<SendData>, P: Into<RecvData>>(
         &self,
-        app: TL,
+        mut app: TL,
         seq_no: SeqNo,
         reply_no: Option<SeqNo>,
         packet: P,
     ) -> Result<RecvSuccess<'_, TL, P, SendData, RecvData, CAP>, Error> {
         let mut seq = self.seq_ex.lock().unwrap();
-        let ret = seq.0.receive_raw(app.clone(), seq_no, reply_no, packet);
+        let ret = seq.0.receive_raw(seq_no, reply_no, packet);
+        if let Err(Error::ResendAck(ack_no)) = ret {
+            app.send_ack(ack_no);
+        }
         if seq.1 > 0 && ret.is_ok() {
             self.send_block.notify_one();
         }
@@ -121,21 +126,30 @@ impl<SendData, RecvData, const CAP: usize> SeqExSync<SendData, RecvData, CAP> {
             ReplyIter { origin: None, app, first: None }
         }
     }
-    pub fn try_send<TL: TransportLayer<SendData>>(&self, app: TL, packet_data: SendData) -> Result<(), SendData> {
+    pub fn try_send<TL: TransportLayer<SendData>>(&self, mut app: TL, packet_data: SendData) -> Result<(), SendData> {
         let mut seq = self.lock();
-        seq.try_send(app, packet_data)
+        let ret = seq.try_send(packet_data, app.time());
+        if let Ok(Payload { seq_no, reply_no, data }) = ret {
+            app.send(seq_no, reply_no, data)
+        }
+        ret.map(|_| ())
     }
     fn send_inner<TL: TransportLayer<SendData>>(
         &self,
         mut seq: MutexGuard<'_, (SeqEx<SendData, RecvData, CAP>, usize)>,
-        app: TL,
+        mut app: TL,
         mut packet_data: SendData,
     ) {
-        while let Err(p) = seq.0.try_send(app.clone(), packet_data) {
-            packet_data = p;
-            seq.1 += 1;
-            seq = self.send_block.wait(seq).unwrap();
-            seq.1 -= 1;
+        loop {
+            let ret = seq.0.try_send(packet_data, app.time());
+            if let Err(p) = ret {
+                packet_data = p;
+                seq.1 += 1;
+                seq = self.send_block.wait(seq).unwrap();
+                seq.1 -= 1;
+            } else if let Ok(Payload { seq_no, reply_no, data }) = ret {
+                app.send(seq_no, reply_no, data)
+            }
         }
     }
     pub fn send<TL: TransportLayer<SendData>>(&self, app: TL, packet_data: SendData) {
