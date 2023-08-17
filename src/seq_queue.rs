@@ -122,7 +122,7 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
     pub fn new(retry_interval: i64, initial_seq_no: SeqNo) -> Self {
         Self {
             resend_interval: retry_interval,
-            next_service_timestamp: i64::MIN,
+            next_service_timestamp: i64::MAX,
             next_send_seq_no: initial_seq_no,
             pre_recv_seq_no: initial_seq_no.wrapping_sub(1),
             recv_window: core::array::from_fn(|_| None),
@@ -151,6 +151,7 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
     ///
     /// When `packet_data` is sent to the remote peer, the receiver should be able to quickly read
     /// the sequence number off of it.
+    #[inline]
     pub fn seq_no(&self) -> SeqNo {
         self.next_send_seq_no
     }
@@ -370,19 +371,24 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
 
     pub fn service(&mut self, mut app: impl TransportLayer<SendData>) -> i64 {
         let current_time = app.time();
-        let next_interval = current_time + self.resend_interval;
-        let mut next_activity = i64::MAX;
-        for entry in self.send_window.iter_mut().flatten() {
-            if entry.next_resend_time <= current_time {
-                entry.next_resend_time = next_interval;
-                app.send(entry.seq_no, entry.reply_no, &entry.data);
-            } else {
-                next_activity = next_activity.min(entry.next_resend_time);
+        let real_interval = if self.next_service_timestamp <= current_time {
+            let next_resend_time = current_time + self.resend_interval;
+            let mut next_activity = i64::MAX;
+            for entry in self.send_window.iter_mut().flatten() {
+                if entry.next_resend_time <= current_time {
+                    entry.next_resend_time = next_resend_time;
+                    app.send(entry.seq_no, entry.reply_no, &entry.data);
+                } else {
+                    next_activity = next_activity.min(entry.next_resend_time);
+                }
             }
-        }
-        self.next_service_timestamp = next_activity;
-        app.update_service_time(next_activity, current_time);
-        self.resend_interval.min(next_activity - current_time)
+            self.next_service_timestamp = next_activity;
+            app.update_service_time(next_activity, current_time);
+            next_activity - current_time
+        } else {
+            self.next_service_timestamp - current_time
+        };
+        self.resend_interval.min(real_interval)
     }
 
     pub fn iter(&self) -> Iter<'_, SendData> {
