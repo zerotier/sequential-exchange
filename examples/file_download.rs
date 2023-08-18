@@ -42,7 +42,7 @@ impl TransportLayer<Payload> for &Transport {
     }
 
     fn send(&mut self, packet: Packet<&Payload>) {
-        if let Ok(p) = serde_json::to_vec(&packet) {
+        if let Ok(p) = serde_cbor::to_vec(&packet) {
             let _ = self.sender.send(p);
         }
     }
@@ -101,7 +101,7 @@ fn receive(peer: &Peer) {
         if drop_packet() {
             continue;
         }
-        if let Ok(parsed_packet) = serde_json::from_slice::<Packet<Payload>>(&packet) {
+        if let Ok(parsed_packet) = serde_cbor::from_slice::<Packet<Payload>>(&packet) {
             for recv_data in peer.seqex.receive_all(&peer.transport, parsed_packet) {
                 process(peer, recv_data);
             }
@@ -141,7 +141,7 @@ fn main() {
     peer1.seqex.send(&peer1.transport, Payload::RequestFile { filename: "File3".to_string() });
     peer1.seqex.send(&peer1.transport, Payload::RequestFile { filename: "File2".to_string() });
 
-    for _ in 0..300 {
+    for _ in 0..500 {
         receive(&peer1);
         receive(&peer2);
         thread::sleep(Duration::from_millis(1));

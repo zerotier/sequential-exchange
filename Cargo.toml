@@ -19,5 +19,4 @@ serde = { version = "1.0.183", default-features = false, features = ["derive"], 
 
 [dev-dependencies]
 rand_core = { version = "0.6.4", features = ["getrandom"]}
-serde_json = { version = "1.0.104" }
 serde_cbor = { version = "0.11.2" }

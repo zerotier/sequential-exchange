@@ -126,6 +126,13 @@ macro_rules! impl_recvok {
                     (None, None) => None,
                 }
             }
+            pub fn map<R>(self, f: impl FnOnce(P) -> R) -> $recv<'a, TL, R, SendData, RecvData, CAP> {
+                match self {
+                    Self::Payload { reply_guard, recv_data } => $recv::Payload { reply_guard, recv_data: f(recv_data) },
+                    Self::Reply { reply_guard, recv_data, send_data } => $recv::Reply { reply_guard, recv_data: f(recv_data), send_data },
+                    Self::Ack { send_data } => $recv::Ack { send_data },
+                }
+            }
         }
         impl<'a, TL: TransportLayer<SendData>, P: Into<RecvData>, SendData, RecvData, const CAP: usize> $recv<'a, TL, P, SendData, RecvData, CAP> {
             pub fn into(self) -> $recv<'a, TL, RecvData, SendData, RecvData, CAP> {

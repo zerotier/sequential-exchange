@@ -13,7 +13,7 @@ use std::{
 };
 
 use rand_core::{OsRng, RngCore};
-use seq_ex::{sync::RecvSuccess, SeqNo, TransportLayer};
+use seq_ex::{SeqNo, TransportLayer, Packet};
 use serde::{Deserialize, Serialize};
 
 /// serde_cbor minimal format is both smaller and faster than default format.
@@ -41,7 +41,7 @@ enum SendData {
 }
 
 #[derive(Serialize, Deserialize)]
-enum Packet<'a> {
+enum Payload<'a> {
     RequestFile { filename: &'a str },
     ConfirmFileSize { filesize: u64 },
     ConfirmDownload { fileid: u64 },
@@ -52,16 +52,18 @@ enum Packet<'a> {
 }
 
 const PACKET_TYPE_PAYLOAD: u8 = 0;
-const PACKET_TYPE_REPLY: u8 = 1;
-const PACKET_TYPE_ACK: u8 = 2;
+const PACKET_TYPE_LOCK_PAYLOAD: u8 = 1;
+const PACKET_TYPE_REPLY: u8 = 2;
+const PACKET_TYPE_LOCK_REPLY: u8 = 3;
+const PACKET_TYPE_ACK: u8 = 4;
 
-fn create_payload(seq_no: SeqNo, packet: &Packet<'_>) -> Vec<u8> {
+fn create_payload(seq_no: SeqNo, packet: &Payload<'_>) -> Vec<u8> {
     let mut p = vec![PACKET_TYPE_PAYLOAD];
     p.extend(&seq_no.to_be_bytes());
     to_writer_minimal(packet, &mut p);
     p
 }
-fn create_reply(seq_no: SeqNo, reply_no: SeqNo, packet: &Packet<'_>) -> Vec<u8> {
+fn create_reply(seq_no: SeqNo, reply_no: SeqNo, packet: &Payload<'_>) -> Vec<u8> {
     let mut p = vec![PACKET_TYPE_REPLY];
     p.extend(&seq_no.to_be_bytes());
     p.extend(&reply_no.to_be_bytes());
@@ -99,29 +101,33 @@ impl TransportLayer<(SendData, Vec<u8>)> for &Transport {
         self.time.elapsed().as_millis() as i64
     }
 
-    fn send(&mut self, _: SeqNo, _: Option<SeqNo>, (_, packet): &(SendData, Vec<u8>)) {
-        let _ = self.sender.send(packet.clone());
-    }
-    fn send_ack(&mut self, reply_no: SeqNo) {
-        let mut p = vec![PACKET_TYPE_ACK];
-        p.extend(&reply_no.to_be_bytes());
-        self.sender.send(p);
+    fn send(&mut self, packet: Packet<&(SendData, Vec<u8>)>) {
+        let p = match packet.consume() {
+            Ok((_, packet)) => packet.clone(),
+            Err(reply_no) => {
+                let mut p = Vec::with_capacity(5);
+                p.push(PACKET_TYPE_ACK);
+                p.extend(&reply_no.to_be_bytes());
+                p
+            }
+        };
+        let _ = self.sender.send(p);
     }
 }
 
-fn process(peer: &Arc<Peer>, transport: &Transport, guard: ReplyGuard<'_>, payload: Packet<'_>, data: Option<SendData>) -> Option<()> {
+fn process(peer: &Arc<Peer>, transport: &Transport, guard: ReplyGuard<'_>, payload: Payload<'_>, data: Option<SendData>) -> Option<()> {
     match (payload, data) {
-        (Packet::RequestFile { filename }, None) => {
+        (Payload::RequestFile { filename }, None) => {
             let file = File::open(peer.home_dir.join(filename)).ok()?;
             let metadata = file.metadata().ok()?;
             let filesize = metadata.len();
             reply!(
                 guard,
                 SendData::ConfirmFileSize { file },
-                Packet::ConfirmFileSize { filesize }
+                Payload::ConfirmFileSize { filesize }
             );
         }
-        (Packet::ConfirmFileSize { filesize }, Some(SendData::RequestFile { filename })) => {
+        (Payload::ConfirmFileSize { filesize }, Some(SendData::RequestFile { filename })) => {
             let path = peer.home_dir.join(filename);
             if filesize > DOWNLOAD_LIMIT {
                 return None;
@@ -129,9 +135,9 @@ fn process(peer: &Arc<Peer>, transport: &Transport, guard: ReplyGuard<'_>, paylo
             let file = File::create(&path).ok()?;
             let fileid = OsRng.next_u64();
             peer.downloads_in_progress.insert(fileid, file);
-            reply!(guard, SendData::ConfirmDownload, Packet::ConfirmDownload { fileid });
+            reply!(guard, SendData::ConfirmDownload, Payload::ConfirmDownload { fileid });
         }
-        (Packet::ConfirmDownload { fileid }, Some(SendData::ConfirmFileSize { mut file })) => {
+        (Payload::ConfirmDownload { fileid }, Some(SendData::ConfirmFileSize { mut file })) => {
             let peer = peer.clone();
             let transport = transport.clone();
             thread::spawn(move || {
@@ -148,7 +154,7 @@ fn process(peer: &Arc<Peer>, transport: &Transport, guard: ReplyGuard<'_>, paylo
                             peer,
                             &transport,
                             SendData::FileDownload,
-                            Packet::FileDownload { fileid, file_chunk: &buffer[i..j] }
+                            Payload::FileDownload { fileid, file_chunk: &buffer[i..j] }
                         );
                         i = j;
                     }
@@ -157,18 +163,18 @@ fn process(peer: &Arc<Peer>, transport: &Transport, guard: ReplyGuard<'_>, paylo
                     peer,
                     &transport,
                     SendData::FileDownload,
-                    Packet::FileDownloadComplete { fileid }
+                    Payload::FileDownloadComplete { fileid }
                 );
             });
         }
-        (Packet::FileDownload { fileid, file_chunk }, None) => {
+        (Payload::FileDownload { fileid, file_chunk }, None) => {
             let mut file = peer.downloads_in_progress.get(&fileid)?;
             let result = file.write_all(file_chunk);
         }
-        (Packet::FileDownloadComplete { fileid }, None) => {
+        (Payload::FileDownloadComplete { fileid }, None) => {
 
         }
-        (Packet::ReadDir, None) => {
+        (Payload::ReadDir, None) => {
             let dir = read_dir(&peer.home_dir).ok()?;
             let mut filenames = Vec::new();
             for entry in dir {
@@ -183,9 +189,9 @@ fn process(peer: &Arc<Peer>, transport: &Transport, guard: ReplyGuard<'_>, paylo
                 }
             }
             let filenames: Vec<&str> = filenames.iter().map(|f| f.as_str()).collect();
-            reply!(guard, SendData::DirContents, Packet::DirContents { filenames });
+            reply!(guard, SendData::DirContents, Payload::DirContents { filenames });
         }
-        (Packet::DirContents { filenames }, Some(SendData::ReadDir { download_missing: true })) => {
+        (Payload::DirContents { filenames }, Some(SendData::ReadDir { download_missing: true })) => {
             drop(guard);
             for filename in filenames {}
         }
@@ -199,30 +205,29 @@ fn receive(peer: &Arc<Peer>, transport: &Transport, receiver: &Receiver<Vec<u8>>
         if drop_packet() {
             continue;
         }
-        let iter = match *packet.get(0)? {
+        let pt = *packet.get(0)?;
+        let (mut parsed_packet, payload_offset) = match pt {
             PACKET_TYPE_ACK => {
                 let reply_no = SeqNo::from_be_bytes(packet.get(1..5)?.try_into().ok()?);
-                let _ = peer.seqex.receive_ack(reply_no);
-                return None;
+                (Packet::Ack(reply_no), 5)
             }
-            PACKET_TYPE_PAYLOAD => {
+            PACKET_TYPE_PAYLOAD | PACKET_TYPE_LOCK_PAYLOAD => {
                 let seq_no = SeqNo::from_be_bytes(packet.get(1..5)?.try_into().ok()?);
-                peer.seqex.receive_all(transport, seq_no, None, packet)
+                (Packet::Payload(seq_no, packet), 5)
             }
-            PACKET_TYPE_REPLY => {
+            PACKET_TYPE_REPLY | PACKET_TYPE_LOCK_REPLY => {
                 let seq_no = SeqNo::from_be_bytes(packet.get(1..5)?.try_into().ok()?);
                 let reply_no = SeqNo::from_be_bytes(packet.get(5..9)?.try_into().ok()?);
-                peer.seqex.receive_all(transport, seq_no, Some(reply_no), packet)
+                (Packet::Reply(seq_no, reply_no, packet), 9)
             }
             _ => return None,
         };
-        for RecvSuccess { guard, packet, send_data } in iter {
-            let offset = match packet[0] {
-                PACKET_TYPE_PAYLOAD => 5,
-                PACKET_TYPE_REPLY => 9,
-                _ => return None,
-            };
-            if let Ok(parsed_packet) = serde_cbor::from_slice::<Packet>(packet.get(offset..)?) {
+        if pt == PACKET_TYPE_LOCK_PAYLOAD || pt == PACKET_TYPE_LOCK_REPLY {
+            parsed_packet.set_locking(true);
+        }
+        for recv_data in peer.seqex.receive_all(transport, parsed_packet) {
+            let recv_data = recv_data.map(|packet| serde_cbor::from_slice::<Payload>(&packet[payload_offset..]));
+            if let Ok(parsed_payload) = serde_cbor::from_slice::<Payload>(packet.get(payload_offset..)?) {
                 process(peer, transport, guard, parsed_packet, send_data.map(|d| d.0));
             }
         }

@@ -148,9 +148,12 @@ impl<RecvData> Packet<RecvData> {
         }
     }
     pub fn payload(self) -> Option<RecvData> {
+        self.consume().ok()
+    }
+    pub fn consume(self) -> Result<RecvData, SeqNo> {
         match self {
-            Payload(_, data) | LockPayload(_, data) | Reply(_, _, data) | LockReply(_, _, data) => Some(data),
-            Ack(_) => None,
+            Payload(_, data) | LockPayload(_, data) | Reply(_, _, data) | LockReply(_, _, data) => Ok(data),
+            Ack(r) => Err(r),
         }
     }
     pub fn is_locking(&self) -> bool {
