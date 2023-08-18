@@ -12,15 +12,24 @@ impl<'a, TL: TransportLayer<SendData>, SendData, RecvData, const CAP: usize> Rep
     /// The identifier will tell the remote peer which packets contain fragments of the file,
     /// and since each fragment will be received in order it will be trivial for them to reconstruct
     /// the original file.
-    pub fn reply(self, packet_data: SendData) {
-        self.reply_with(|_, _| packet_data)
+    pub fn reply(self,  packet_data: SendData) {
+        self.reply_inner(false, |_, _| packet_data)
     }
-    pub fn reply_with(mut self, packet_data: impl FnOnce(SeqNo, SeqNo) -> SendData) {
+    pub fn reply_locked(self, packet_data: SendData) {
+        self.reply_inner(true, |_, _| packet_data)
+    }
+    pub fn reply_with(self, packet_data: impl FnOnce(SeqNo, SeqNo) -> SendData) {
+        self.reply_inner(false, packet_data)
+    }
+    pub fn reply_locked_with(self, packet_data: impl FnOnce(SeqNo, SeqNo) -> SendData) {
+        self.reply_inner(true, packet_data)
+    }
+    fn reply_inner(mut self, locked: bool, packet_data: impl FnOnce(SeqNo, SeqNo) -> SendData) {
         let mut app = None;
         core::mem::swap(&mut app, &mut self.app);
         let seq_no = self.seq.seq_no();
         self.seq
-            .reply_raw(app.unwrap(), self.reply_no, self.locked, packet_data(seq_no, self.reply_no));
+            .reply_raw(app.unwrap(), self.reply_no, self.locked, locked, packet_data(seq_no, self.reply_no));
         core::mem::forget(self);
     }
 }
@@ -45,7 +54,7 @@ pub enum Error<RecvData> {
     /// invalid to process it right now. No action needs to be taken by the caller.
     OutOfSequence,
     /// The Send Window is currently full. The received packet cannot be processed right now because
-    /// it could cause the send window to overflow. No action needs to be taken by the caller.
+    /// it could cause the send window to overflow.
     WindowIsFull(Packet<RecvData>),
     WindowIsLocked(Packet<RecvData>),
 }
@@ -133,18 +142,20 @@ impl_recvok!(RecvOk, &'a mut SeqEx<SendData, RecvData, CAP>);
 pub(crate) use impl_recvok;
 
 impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
-    pub fn try_send(&mut self, mut app: impl TransportLayer<SendData>, packet_data: SendData) -> Result<(), SendData> {
+    pub fn try_send(&mut self, mut app: impl TransportLayer<SendData>, locked: bool, packet_data: SendData) -> Result<(), SendData> {
         match self.try_send_direct(packet_data, app.time()) {
-            Ok(p) => {
+            Ok(mut p) => {
+                p.set_locking(locked);
                 app.send(p);
                 Ok(())
             }
             Err(e) => Err(e),
         }
     }
-    pub fn try_send_with(&mut self, mut app: impl TransportLayer<SendData>, packet_data: impl FnOnce(SeqNo) -> SendData) -> Result<(), ()> {
+    pub fn try_send_with(&mut self, mut app: impl TransportLayer<SendData>, locked: bool, packet_data: impl FnOnce(SeqNo) -> SendData) -> Result<(), ()> {
         match self.try_send_direct_with(packet_data, app.time()) {
-            Ok(p) => {
+            Ok(mut p) => {
+                p.set_locking(locked);
                 app.send(p);
                 Ok(())
             }
@@ -168,8 +179,9 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
             Err(DirectError::WindowIsLocked(p)) => Err(Error::WindowIsLocked(p)),
         }
     }
-    pub fn reply_raw(&mut self, mut app: impl TransportLayer<SendData>, reply_no: SeqNo, unlock: bool, packet_data: SendData) {
-        if let Some(p) = self.reply_raw_and_direct(reply_no, unlock, packet_data, app.time()) {
+    pub fn reply_raw(&mut self, mut app: impl TransportLayer<SendData>, reply_no: SeqNo, unlock: bool, locked_packet: bool, packet_data: SendData) {
+        if let Some(mut p) = self.reply_raw_and_direct(reply_no, unlock, packet_data, app.time()) {
+            p.set_locking(locked_packet);
             app.send(p)
         }
     }

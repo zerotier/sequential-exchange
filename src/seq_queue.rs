@@ -88,7 +88,7 @@ pub enum DirectError<RecvData> {
     /// invalid to process it right now. No action needs to be taken by the caller.
     OutOfSequence,
     /// The Send Window is currently full. The received packet cannot be processed right now because
-    /// it could cause the send window to overflow. No action needs to be taken by the caller.
+    /// it could cause the send window to overflow.
     WindowIsFull(Packet<RecvData>),
     WindowIsLocked(Packet<RecvData>),
     ResendAck(SeqNo),

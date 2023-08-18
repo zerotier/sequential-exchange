@@ -70,7 +70,7 @@ fn process(peer: &Peer, recv_data: RecvOk<'_, &Transport, Payload, Payload, Payl
                     let mut i = 0;
                     while i < file.len() {
                         let j = file.len().min(i + FILE_CHUNK_SIZE);
-                        seqex.send(&transport, FileDownload { filename: filename.clone(), file_chunk: file[i..j].to_vec() });
+                        seqex.send_locked(&transport, FileDownload { filename: filename.clone(), file_chunk: file[i..j].to_vec() });
                         i = j;
                     }
                 }
