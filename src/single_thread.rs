@@ -18,8 +18,8 @@ impl<'a, TL: TransportLayer<SendData>, SendData, RecvData, const CAP: usize> Rep
 }
 impl<'a, TL: TransportLayer<SendData>, SendData, RecvData, const CAP: usize> Drop for ReplyGuard<'a, TL, SendData, RecvData, CAP> {
     fn drop(&mut self) {
-        if self.0.ack_direct(self.2) {
-            self.1.send_ack(self.2)
+        if let Some(p) = self.0.ack_direct(self.2) {
+            self.1.send(p)
         }
     }
 }
@@ -31,6 +31,9 @@ pub struct RecvSuccess<'a, TL: TransportLayer<SendData>, P: Into<RecvData>, Send
 }
 
 impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
+    pub fn try_send_raw(&mut self, packet_data: SendData, current_time: i64) -> Result<Packet<'_, SendData>, SendData> {
+
+    }
     /// If this returns `Ok` then `try_send` might succeed on next call.
     pub fn receive_raw<P: Into<RecvData>>(
         &mut self,

@@ -1,4 +1,4 @@
-use crate::SeqNo;
+use crate::Packet;
 
 /// A trait for giving an instance of SeqEx access to the transport layer.
 ///
@@ -9,6 +9,5 @@ use crate::SeqNo;
 pub trait TransportLayer<SendData>: Clone {
     fn time(&mut self) -> i64;
 
-    fn send(&mut self, seq_no: SeqNo, reply_no: Option<SeqNo>, data: &SendData);
-    fn send_ack(&mut self, reply_no: SeqNo);
+    fn send(&mut self, packet: Packet<'_, SendData>);
 }
