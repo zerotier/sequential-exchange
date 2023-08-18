@@ -1,9 +1,8 @@
-use std::
-    sync::{
-        Mutex, MutexGuard,
-    }
-;
-use tokio::{task, sync::{Notify, oneshot, mpsc}, time};
+use std::sync::{Mutex, MutexGuard};
+use tokio::{
+    sync::{mpsc, oneshot, Notify},
+    task, time,
+};
 
 use crate::{Error, SeqEx, SeqNo, TransportLayer, DEFAULT_INITIAL_SEQ_NO, DEFAULT_RESEND_INTERVAL_MS, DEFAULT_WINDOW_CAP};
 
@@ -82,11 +81,7 @@ pub struct TokioTransport<TL: TokioTransportLayer> {
 impl<TL: TokioTransportLayer> TokioTransport<TL> {
     pub fn new<const CAP: usize, S: AsRef<SeqExTokio<TL::Packet, CAP>> + Send + 'static>(app: TL, seq: S) -> Self {
         let (update_queue, mut recv) = mpsc::channel(4);
-        let ret = TokioTransport {
-            time: time::Instant::now(),
-            update_queue,
-            app,
-        };
+        let ret = TokioTransport { time: time::Instant::now(), update_queue, app };
         let task_tl = ret.clone();
         task::spawn(async move {
             let mut update_ts = i64::MAX;
@@ -96,7 +91,7 @@ impl<TL: TokioTransportLayer> TokioTransport<TL> {
                     let mut do_update = diff <= 0;
                     if diff > 0 {
                         let sleep = time::sleep(time::Duration::from_millis(diff as u64));
-                        tokio::select!{
+                        tokio::select! {
                             Some(up) = recv.recv() => {
                                 update_ts = up;
                             }
@@ -131,7 +126,7 @@ impl<Packet, const CAP: usize> SeqExTokio<Packet, CAP> {
         &'a self,
         app: &'a TokioTransport<TL>,
         mut seq: MutexGuard<'_, (SeqEx<SendData<Packet>, Packet, CAP>, usize)>,
-        result: Result<(SeqNo, Packet, Option<SendData<Packet>>), Error>
+        result: Result<(SeqNo, Packet, Option<SendData<Packet>>), Error>,
     ) -> Option<(Packet, ReplyGuard<'_, TL, Packet, CAP>)> {
         if let Ok((reply_no, packet, send_data)) = result {
             if seq.1 > 0 {
@@ -161,7 +156,10 @@ impl<Packet, const CAP: usize> SeqExTokio<Packet, CAP> {
         let result = seq.0.receive_raw(app, seq_no, reply_no, packet);
         self.process(app, seq, result)
     }
-    pub fn pump<'a, TL: TokioTransportLayer<Packet = Packet>>(&'a self, app: &'a TokioTransport<TL>) -> Option<(Packet, ReplyGuard<'_, TL, Packet, CAP>)> {
+    pub fn pump<'a, TL: TokioTransportLayer<Packet = Packet>>(
+        &'a self,
+        app: &'a TokioTransport<TL>,
+    ) -> Option<(Packet, ReplyGuard<'_, TL, Packet, CAP>)> {
         let mut seq = self.seq_ex.lock().unwrap();
         let result = seq.0.pump_raw();
         self.process(app, seq, result)
@@ -197,7 +195,7 @@ impl<Packet, const CAP: usize> SeqExTokio<Packet, CAP> {
         mut seq: MutexGuard<'_, (SeqEx<SendData<Packet>, Packet, CAP>, usize)>,
         app: &TokioTransport<TL>,
         mut tx: oneshot::Sender<(Packet, SeqNo)>,
-        mut packet: Packet
+        mut packet: Packet,
     ) {
         let mut pre_ts = seq.0.next_service_timestamp;
         while let Err(e) = seq.0.try_send(app, (tx, packet)) {
@@ -214,7 +212,11 @@ impl<Packet, const CAP: usize> SeqExTokio<Packet, CAP> {
         }
     }
     /// If this future is dropped then the remote peer's reply to this packet will also be dropped.
-    pub async fn send<'a, TL: TokioTransportLayer<Packet = Packet>>(&'a self, app: &'a TokioTransport<TL>, packet: Packet) -> Option<(Packet, ReplyGuard<'_, TL, Packet, CAP>)> {
+    pub async fn send<'a, TL: TokioTransportLayer<Packet = Packet>>(
+        &'a self,
+        app: &'a TokioTransport<TL>,
+        packet: Packet,
+    ) -> Option<(Packet, ReplyGuard<'_, TL, Packet, CAP>)> {
         self.send_with(app, |_| packet).await
     }
     //pub fn try_send_with<TL: TransportLayer<SendData>>(&self, app: TL, packet_data: impl FnOnce(SeqNo) -> SendData) -> Result<(), SendData> {
@@ -222,7 +224,11 @@ impl<Packet, const CAP: usize> SeqExTokio<Packet, CAP> {
     //    let seq_no = seq.seq_no();
     //    seq.try_send(app, packet_data(seq_no))
     //}
-    pub async fn send_with<'a, TL: TokioTransportLayer<Packet = Packet>>(&'a self, app: &'a TokioTransport<TL>, packet: impl FnOnce(SeqNo) -> Packet) -> Option<(Packet, ReplyGuard<'_, TL, Packet, CAP>)> {
+    pub async fn send_with<'a, TL: TokioTransportLayer<Packet = Packet>>(
+        &'a self,
+        app: &'a TokioTransport<TL>,
+        packet: impl FnOnce(SeqNo) -> Packet,
+    ) -> Option<(Packet, ReplyGuard<'_, TL, Packet, CAP>)> {
         let (tx, rx) = oneshot::channel();
         let seq = self.seq_ex.lock().unwrap();
         let seq_no = seq.0.seq_no();

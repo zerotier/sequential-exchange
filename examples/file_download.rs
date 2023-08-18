@@ -11,8 +11,8 @@ use std::{
 
 use rand_core::{OsRng, RngCore};
 use seq_ex::{
-    sync::{PacketType, RecvSuccess, ReplyGuard, SeqExSync},
-    SeqNo, TransportLayer,
+    sync::{PacketOwned, RecvSuccess, ReplyGuard, SeqExSync},
+    TransportLayer,
 };
 use serde::{Deserialize, Serialize};
 
@@ -41,15 +41,8 @@ impl TransportLayer<Packet> for &Transport {
         self.time.elapsed().as_millis() as i64
     }
 
-    fn send(&mut self, seq_no: SeqNo, reply_no: Option<SeqNo>, payload: &Packet) {
-        let p = PacketType::Payload(seq_no, reply_no, payload.clone());
-        if let Ok(p) = serde_json::to_vec(&p) {
-            let _ = self.sender.send(p);
-        }
-    }
-
-    fn send_ack(&mut self, reply_no: SeqNo) {
-        let p = PacketType::<Packet>::Ack(reply_no);
+    fn send(&mut self, packet: seq_ex::Packet<'_, Packet>) {
+        let p = PacketOwned::from(packet);
         if let Ok(p) = serde_json::to_vec(&p) {
             let _ = self.sender.send(p);
         }
@@ -110,12 +103,12 @@ fn receive(peer: &Peer) {
         if drop_packet() {
             continue;
         }
-        let parsed_packet = serde_json::from_slice::<PacketType<Packet>>(&packet);
+        let parsed_packet = serde_json::from_slice::<PacketOwned<Packet>>(&packet);
         match parsed_packet {
-            Ok(PacketType::Ack(reply_no)) => {
+            Ok(PacketOwned::Ack(reply_no)) => {
                 let _ = peer.seqex.receive_ack(reply_no);
             }
-            Ok(PacketType::Payload(seq_no, reply_no, payload)) => {
+            Ok(PacketOwned::Payload(seq_no, reply_no, payload)) => {
                 for RecvSuccess { guard, packet, send_data } in peer.seqex.receive_all(&peer.transport, seq_no, reply_no, payload) {
                     process(peer, guard, packet, send_data);
                 }

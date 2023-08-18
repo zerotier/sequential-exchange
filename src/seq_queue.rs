@@ -113,7 +113,7 @@ pub enum Packet<'a, SendData> {
     },
     Ack {
         reply_no: SeqNo,
-    }
+    },
 }
 
 /// An iterator over all packets in the send window. It will iterate over all packets currently
@@ -247,7 +247,11 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
         debug_assert!(slot.is_none());
         let entry = slot.insert(SendEntry { seq_no, reply_no: None, next_resend_time, data: packet_data });
 
-        Ok(Packet::Payload { seq_no: entry.seq_no, reply_no: entry.reply_no, data: &entry.data })
+        Ok(Packet::Payload {
+            seq_no: entry.seq_no,
+            reply_no: entry.reply_no,
+            data: &entry.data,
+        })
     }
 
     /// If this returns `Ok` then `try_send` might succeed on next call.
@@ -378,7 +382,11 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
                 data: packet_data,
             });
 
-            Some(Packet::Payload { seq_no: entry.seq_no, reply_no: entry.reply_no, data: &entry.data })
+            Some(Packet::Payload {
+                seq_no: entry.seq_no,
+                reply_no: entry.reply_no,
+                data: &entry.data,
+            })
         } else {
             None
         }
@@ -391,19 +399,21 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
         }
     }
 
-    pub fn service<'a>(&'a mut self, current_time: i64, iter: &mut Option<ServiceIter>) -> Option<Packet<'a, SendData>> {
+    pub fn service_direct<'a>(&'a mut self, current_time: i64, iter: &mut Option<ServiceIter>) -> Option<Packet<'a, SendData>> {
         if self.next_service_timestamp <= current_time {
-            let iter = iter.get_or_insert(ServiceIter {
-                idx: 0,
-                next_time: i64::MAX,
-            });
+            let iter = iter.get_or_insert(ServiceIter { idx: 0, next_time: i64::MAX });
             while let Some(entry) = self.send_window.get(iter.idx) {
                 iter.idx += 1;
                 if let Some(entry) = entry {
                     if entry.next_resend_time <= current_time {
+                        let entry = self.send_window[iter.idx - 1].as_mut().unwrap();
                         entry.next_resend_time = current_time + self.resend_interval;
                         iter.next_time = iter.next_time.min(entry.next_resend_time);
-                        return Some(Packet::Payload { seq_no: entry.seq_no, reply_no: entry.reply_no, data: &entry.data });
+                        return Some(Packet::Payload {
+                            seq_no: entry.seq_no,
+                            reply_no: entry.reply_no,
+                            data: &entry.data,
+                        });
                     } else {
                         iter.next_time = iter.next_time.min(entry.next_resend_time);
                     }

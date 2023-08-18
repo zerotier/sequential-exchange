@@ -7,7 +7,7 @@ use std::{
     time::Instant,
 };
 
-use crate::{Error, SeqEx, SeqNo, TransportLayer, DEFAULT_INITIAL_SEQ_NO, DEFAULT_RESEND_INTERVAL_MS, DEFAULT_WINDOW_CAP};
+use crate::{Error, Packet, SeqEx, SeqNo, TransportLayer, DEFAULT_INITIAL_SEQ_NO, DEFAULT_RESEND_INTERVAL_MS, DEFAULT_WINDOW_CAP};
 
 pub struct SeqExSync<SendData, RecvData, const CAP: usize = DEFAULT_WINDOW_CAP> {
     seq_ex: Mutex<(SeqEx<SendData, RecvData, CAP>, usize)>,
@@ -189,25 +189,33 @@ impl<'a, TL: TransportLayer<SendData>, SendData, RecvData, const CAP: usize> Ite
 
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone)]
-pub enum PacketType<Payload: Clone> {
+pub enum PacketOwned<Payload: Clone> {
     Payload(SeqNo, Option<SeqNo>, Payload),
     Ack(SeqNo),
+}
+impl<'a, Payload: Clone> From<Packet<'a, Payload>> for PacketOwned<Payload> {
+    fn from(value: Packet<'a, Payload>) -> Self {
+        match value {
+            Packet::Payload { seq_no, reply_no, data } => PacketOwned::Payload(seq_no, reply_no, data.clone()),
+            Packet::Ack { reply_no } => PacketOwned::Ack(reply_no),
+        }
+    }
 }
 
 #[derive(Clone)]
 pub struct MpscTransport<Payload: Clone> {
-    pub channel: Sender<PacketType<Payload>>,
+    pub channel: Sender<PacketOwned<Payload>>,
     pub time: Instant,
 }
 pub type MpscGuard<'a, Packet> = ReplyGuard<'a, &'a MpscTransport<Packet>, Packet, Packet>;
 pub type MpscSeqEx<Packet> = SeqExSync<Packet, Packet>;
 
 impl<Payload: Clone> MpscTransport<Payload> {
-    pub fn new() -> (Self, Receiver<PacketType<Payload>>) {
+    pub fn new() -> (Self, Receiver<PacketOwned<Payload>>) {
         let (send, recv) = channel();
         (Self { channel: send, time: std::time::Instant::now() }, recv)
     }
-    pub fn from_sender(send: Sender<PacketType<Payload>>) -> Self {
+    pub fn from_sender(send: Sender<PacketOwned<Payload>>) -> Self {
         Self { channel: send, time: std::time::Instant::now() }
     }
 }
@@ -216,10 +224,7 @@ impl<Payload: Clone> TransportLayer<Payload> for &MpscTransport<Payload> {
         self.time.elapsed().as_millis() as i64
     }
 
-    fn send(&mut self, seq_no: SeqNo, reply_no: Option<SeqNo>, payload: &Payload) {
-        let _ = self.channel.send(PacketType::Payload(seq_no, reply_no, payload.clone()));
-    }
-    fn send_ack(&mut self, reply_no: SeqNo) {
-        let _ = self.channel.send(PacketType::Ack(reply_no));
+    fn send(&mut self, packet: Packet<'_, Payload>) {
+        let _ = self.channel.send(PacketOwned::from(packet));
     }
 }
