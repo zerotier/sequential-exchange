@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
-    io::Read,
+    fs::{read_dir, File},
+    io::{Read, Write},
     ops::Deref,
     path::PathBuf,
     sync::{
@@ -14,8 +15,6 @@ use std::{
 use rand_core::{OsRng, RngCore};
 use seq_ex::{sync::RecvSuccess, SeqNo, TransportLayer};
 use serde::{Deserialize, Serialize};
-use smol::fs::File;
-use smol::prelude::*;
 
 /// serde_cbor minimal format is both smaller and faster than default format.
 /// The overhead is ~33% faster.
@@ -34,18 +33,22 @@ const DOWNLOAD_LIMIT: u64 = 1000000;
 #[derive(Debug)]
 enum SendData {
     RequestFile { filename: String },
-    ConfirmFileSize { filename: String, file: File },
+    ConfirmFileSize { file: File },
     ConfirmDownload,
     FileDownload,
+    ReadDir { download_missing: bool },
+    DirContents,
 }
 
 #[derive(Serialize, Deserialize)]
 enum Packet<'a> {
     RequestFile { filename: &'a str },
     ConfirmFileSize { filesize: u64 },
-    ConfirmDownload,
-    FileDownload { filename: &'a str, file_chunk: &'a [u8] },
-    FileDownloadComplete { filename: &'a str },
+    ConfirmDownload { fileid: u64 },
+    FileDownload { fileid: u64, file_chunk: &'a [u8] },
+    FileDownloadComplete { fileid: u64 },
+    ReadDir,
+    DirContents { filenames: Vec<&'a str> },
 }
 
 const PACKET_TYPE_PAYLOAD: u8 = 0;
@@ -71,10 +74,8 @@ macro_rules! reply {
     };
 }
 macro_rules! send {
-    ($peer:expr, $send_data:expr, $packet: expr) => {
-        $peer
-            .seqex
-            .send_with(&$peer.transport, |seq_no| ($send_data, create_payload(seq_no, &$packet)))
+    ($peer:expr, $trans:expr, $send_data:expr, $packet: expr) => {
+        $peer.seqex.send_with($trans, |seq_no| ($send_data, create_payload(seq_no, &$packet)))
     };
 }
 
@@ -88,8 +89,8 @@ struct Transport {
 }
 
 struct Peer {
+    downloads_in_progress: HashMap<u64, File>,
     home_dir: PathBuf,
-    transport: Transport,
     seqex: SeqEx,
 }
 
@@ -108,15 +109,15 @@ impl TransportLayer<(SendData, Vec<u8>)> for &Transport {
     }
 }
 
-async fn process(peer: Arc<Peer>, guard: ReplyGuard<'_>, payload: Packet<'_>, data: Option<SendData>) -> Option<()> {
+fn process(peer: &Arc<Peer>, transport: &Transport, guard: ReplyGuard<'_>, payload: Packet<'_>, data: Option<SendData>) -> Option<()> {
     match (payload, data) {
         (Packet::RequestFile { filename }, None) => {
-            let file = File::open(peer.home_dir.join(filename)).await.ok()?;
-            let metadata = file.metadata().await.ok()?;
+            let file = File::open(peer.home_dir.join(filename)).ok()?;
+            let metadata = file.metadata().ok()?;
             let filesize = metadata.len();
             reply!(
                 guard,
-                SendData::ConfirmFileSize { filename: filename.to_string(), file },
+                SendData::ConfirmFileSize { file },
                 Packet::ConfirmFileSize { filesize }
             );
         }
@@ -125,39 +126,75 @@ async fn process(peer: Arc<Peer>, guard: ReplyGuard<'_>, payload: Packet<'_>, da
             if filesize > DOWNLOAD_LIMIT {
                 return None;
             }
-            let file = File::open(&path).await;
-            if file.is_ok() {
-                return None;
-            }
-            reply!(guard, SendData::ConfirmDownload, Packet::ConfirmDownload);
+            let file = File::create(&path).ok()?;
+            let fileid = OsRng.next_u64();
+            peer.downloads_in_progress.insert(fileid, file);
+            reply!(guard, SendData::ConfirmDownload, Packet::ConfirmDownload { fileid });
         }
-        (Packet::ConfirmDownload, Some(SendData::ConfirmFileSize { filename, mut file })) => {
-            drop(guard);
-            const BUFFERED_CHUNKS: usize = 10;
-            let mut buffer = [0u8; BUFFERED_CHUNKS * FILE_CHUNK_SIZE];
-            while let Ok(n) = file.read(&mut buffer).await {
-                if n == 0 {
-                    break;
+        (Packet::ConfirmDownload { fileid }, Some(SendData::ConfirmFileSize { mut file })) => {
+            let peer = peer.clone();
+            let transport = transport.clone();
+            thread::spawn(move || {
+                const BUFFERED_CHUNKS: usize = 10;
+                let mut buffer = [0u8; BUFFERED_CHUNKS * FILE_CHUNK_SIZE];
+                while let Ok(n) = file.read(&mut buffer) {
+                    if n == 0 {
+                        break;
+                    }
+                    let mut i = 0;
+                    while i < n {
+                        let j = n.min(i + FILE_CHUNK_SIZE);
+                        send!(
+                            peer,
+                            &transport,
+                            SendData::FileDownload,
+                            Packet::FileDownload { fileid, file_chunk: &buffer[i..j] }
+                        );
+                        i = j;
+                    }
                 }
-                let mut i = 0;
-                while i < n {
-                    let j = n.min(i + FILE_CHUNK_SIZE);
-                    send!(
-                        peer,
-                        SendData::FileDownload,
-                        Packet::FileDownload { filename: &filename, file_chunk: &buffer[i..j] }
-                    );
-                    i = j;
+                send!(
+                    peer,
+                    &transport,
+                    SendData::FileDownload,
+                    Packet::FileDownloadComplete { fileid }
+                );
+            });
+        }
+        (Packet::FileDownload { fileid, file_chunk }, None) => {
+            let mut file = peer.downloads_in_progress.get(&fileid)?;
+            let result = file.write_all(file_chunk);
+        }
+        (Packet::FileDownloadComplete { fileid }, None) => {
+
+        }
+        (Packet::ReadDir, None) => {
+            let dir = read_dir(&peer.home_dir).ok()?;
+            let mut filenames = Vec::new();
+            for entry in dir {
+                if let Ok(entry) = entry {
+                    if entry.file_type().map_or(false, |f| f.is_file()) {
+                        if let Ok(filename) = entry.file_name().into_string() {
+                            filenames.push(filename)
+                        }
+                    }
+                } else {
+                    return None;
                 }
             }
-            send!(peer, SendData::FileDownload, Packet::FileDownloadComplete { filename: &filename });
+            let filenames: Vec<&str> = filenames.iter().map(|f| f.as_str()).collect();
+            reply!(guard, SendData::DirContents, Packet::DirContents { filenames });
+        }
+        (Packet::DirContents { filenames }, Some(SendData::ReadDir { download_missing: true })) => {
+            drop(guard);
+            for filename in filenames {}
         }
         _ => {}
     }
     Some(())
 }
 
-async fn receive(peer: &Arc<Peer>, receiver: &Receiver<Vec<u8>>) -> Option<()> {
+fn receive(peer: &Arc<Peer>, transport: &Transport, receiver: &Receiver<Vec<u8>>) -> Option<()> {
     while let Ok(packet) = receiver.try_recv() {
         if drop_packet() {
             continue;
@@ -170,12 +207,12 @@ async fn receive(peer: &Arc<Peer>, receiver: &Receiver<Vec<u8>>) -> Option<()> {
             }
             PACKET_TYPE_PAYLOAD => {
                 let seq_no = SeqNo::from_be_bytes(packet.get(1..5)?.try_into().ok()?);
-                peer.seqex.receive_all(&peer.transport, seq_no, None, packet)
+                peer.seqex.receive_all(transport, seq_no, None, packet)
             }
             PACKET_TYPE_REPLY => {
                 let seq_no = SeqNo::from_be_bytes(packet.get(1..5)?.try_into().ok()?);
                 let reply_no = SeqNo::from_be_bytes(packet.get(5..9)?.try_into().ok()?);
-                peer.seqex.receive_all(&peer.transport, seq_no, Some(reply_no), packet)
+                peer.seqex.receive_all(transport, seq_no, Some(reply_no), packet)
             }
             _ => return None,
         };
@@ -186,7 +223,7 @@ async fn receive(peer: &Arc<Peer>, receiver: &Receiver<Vec<u8>>) -> Option<()> {
                 _ => return None,
             };
             if let Ok(parsed_packet) = serde_cbor::from_slice::<Packet>(packet.get(offset..)?) {
-                process(peer.clone(), guard, parsed_packet, send_data.map(|d| d.0)).await;
+                process(peer, transport, guard, parsed_packet, send_data.map(|d| d.0));
             }
         }
     }
@@ -196,6 +233,10 @@ async fn receive(peer: &Arc<Peer>, receiver: &Receiver<Vec<u8>>) -> Option<()> {
 fn main() {
     let alice_root = std::path::Path::new("examples").join("alice_home");
     let bob_root = std::path::Path::new("examples").join("bob_home");
+    let (s, r) = channel::<i32>();
+    thread::spawn(move || {
+        s.send(0);
+    });
 }
 
 #[test]
