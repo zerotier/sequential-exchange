@@ -10,12 +10,12 @@ path = "src/lib.rs"
 doc = true
 
 [features]
-default = ["std", "serde", "tokio"]
+default = ["std", "serde"]
 std = []
 
 [dependencies]
 serde = { version = "1.0.183", default-features = false, features = ["derive"], optional = true }
-tokio = { version = "1.31.0", default-features = false, features = ["sync", "rt", "time", "macros"], optional = true }
+#tokio = { version = "1.31.0", default-features = false, features = ["sync", "rt", "time", "macros"], optional = true }
 
 [dev-dependencies]
 rand_core = { version = "0.6.4", features = ["getrandom"]}
