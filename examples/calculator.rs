@@ -1,9 +1,12 @@
 use std::{sync::mpsc::Receiver, thread, time::Duration};
 
-use seq_ex::sync::{MpscGuard, MpscSeqEx, MpscTransport, PacketType, RecvSuccess};
+use seq_ex::{
+    sync::{MpscSeqEx, MpscTransport},
+    Packet,
+};
 
 #[derive(Clone)]
-enum Packet {
+enum Payload {
     Add(f32),
     Sub(f32),
     Mul(f32),
@@ -16,28 +19,20 @@ fn drop_packet() -> bool {
     rand_core::OsRng.next_u32() & 1 > 0
 }
 
-fn process(_: MpscGuard<'_, Packet>, recv_packet: Packet, _: Option<Packet>, value: &mut f32) {
-    use Packet::*;
-    match recv_packet {
-        Add(n) => *value = *value + n,
-        Sub(n) => *value = *value - n,
-        Mul(n) => *value = *value * n,
-        Div(n) => *value = *value / n,
-        Mod(n) => *value = *value % n,
-    }
-}
-
-fn receive(recv: &Receiver<PacketType<Packet>>, seq: &MpscSeqEx<Packet>, transport: &MpscTransport<Packet>, value: &mut f32) {
+fn receive(recv: &Receiver<Packet<Payload>>, seq: &MpscSeqEx<Payload>, transport: &MpscTransport<Payload>, value: &mut f32) {
     while let Ok(packet) = recv.try_recv() {
-        if !drop_packet() {
-            match packet {
-                PacketType::Ack(reply_no) => {
-                    let _ = seq.receive_ack(reply_no);
-                }
-                PacketType::Payload(seq_no, reply_no, payload) => {
-                    for RecvSuccess { guard, packet, send_data } in seq.receive_all(transport, seq_no, reply_no, payload) {
-                        process(guard, packet, send_data, value);
-                    }
+        if drop_packet() {
+            continue;
+        }
+        for recv_data in seq.receive_all(transport, packet) {
+            use Payload::*;
+            if let Some((_, recv_packet)) = recv_data.consume().0 {
+                match recv_packet {
+                    Add(n) => *value = *value + n,
+                    Sub(n) => *value = *value - n,
+                    Mul(n) => *value = *value * n,
+                    Div(n) => *value = *value / n,
+                    Mod(n) => *value = *value % n,
                 }
             }
         }
@@ -52,15 +47,15 @@ fn main() {
     let mut value = 0.0;
     let mut remote_value = value;
 
-    seq1.send(&transport1, Packet::Add(1.0));
+    seq1.send(&transport1, Payload::Add(1.0));
     value += 1.0;
-    seq1.send(&transport1, Packet::Sub(2.0));
+    seq1.send(&transport1, Payload::Sub(2.0));
     value -= 2.0;
-    seq1.send(&transport1, Packet::Mul(3.0));
+    seq1.send(&transport1, Payload::Mul(3.0));
     value *= 3.0;
-    seq1.send(&transport1, Packet::Div(4.0));
+    seq1.send(&transport1, Payload::Div(4.0));
     value /= 4.0;
-    seq1.send(&transport1, Packet::Mod(5.0));
+    seq1.send(&transport1, Payload::Mod(5.0));
     value %= 5.0;
 
     for _ in 0..16 {
