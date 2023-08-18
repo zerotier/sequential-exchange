@@ -7,7 +7,7 @@ use std::{
     time::Instant,
 };
 
-use crate::{Error, Packet, SeqEx, SeqNo, TransportLayer, DEFAULT_INITIAL_SEQ_NO, DEFAULT_RESEND_INTERVAL_MS, DEFAULT_WINDOW_CAP};
+use crate::{Error, Packet, RecvOkRaw, SeqEx, SeqNo, TransportLayer, DEFAULT_INITIAL_SEQ_NO, DEFAULT_RESEND_INTERVAL_MS, DEFAULT_WINDOW_CAP};
 
 pub struct SeqExSync<SendData, RecvData, const CAP: usize = DEFAULT_WINDOW_CAP> {
     seq_ex: Mutex<(SeqEx<SendData, RecvData, CAP>, usize)>,
@@ -15,7 +15,7 @@ pub struct SeqExSync<SendData, RecvData, const CAP: usize = DEFAULT_WINDOW_CAP> 
 }
 
 pub struct ReplyGuard<'a, TL: TransportLayer<SendData>, SendData, RecvData, const CAP: usize = DEFAULT_WINDOW_CAP> {
-    origin: &'a SeqExSync<SendData, RecvData, CAP>,
+    seq: &'a SeqExSync<SendData, RecvData, CAP>,
     app: TL,
     reply_no: SeqNo,
 }
@@ -26,12 +26,12 @@ impl<'a, TL: TransportLayer<SendData>, SendData, RecvData, const CAP: usize> Rep
     /// and since each fragment will be received in order it will be trivial for them to reconstruct
     /// the original file.
     pub fn reply(self, packet_data: SendData) {
-        let mut seq = self.origin.lock();
+        let mut seq = self.seq.lock();
         seq.reply_raw(self.app.clone(), self.reply_no, packet_data);
         core::mem::forget(self);
     }
     pub fn reply_with(self, packet_data: impl FnOnce(SeqNo, SeqNo) -> SendData) {
-        let mut seq = self.origin.lock();
+        let mut seq = self.seq.lock();
         let seq_no = seq.seq_no();
         seq.reply_raw(self.app.clone(), self.reply_no, packet_data(seq_no, self.reply_no));
         core::mem::forget(self);
@@ -39,21 +39,92 @@ impl<'a, TL: TransportLayer<SendData>, SendData, RecvData, const CAP: usize> Rep
 }
 impl<'a, TL: TransportLayer<SendData>, SendData, RecvData, const CAP: usize> Drop for ReplyGuard<'a, TL, SendData, RecvData, CAP> {
     fn drop(&mut self) {
-        let mut seq = self.origin.lock();
+        let mut seq = self.seq.lock();
         seq.ack_raw(self.app.clone(), self.reply_no);
     }
 }
-
-pub struct RecvSuccess<'a, TL: TransportLayer<SendData>, P: Into<RecvData>, SendData, RecvData, const CAP: usize = DEFAULT_WINDOW_CAP> {
-    pub guard: ReplyGuard<'a, TL, SendData, RecvData, CAP>,
-    pub packet: P,
-    pub send_data: Option<SendData>,
+impl<'a, TL: TransportLayer<SendData>, SendData, RecvData, const CAP: usize> std::fmt::Debug for ReplyGuard<'a, TL, SendData, RecvData, CAP> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReplyGuard").field("reply_no", &self.reply_no).finish()
+    }
 }
 
-pub struct ReplyIter<'a, TL: TransportLayer<SendData>, SendData, RecvData, const CAP: usize = DEFAULT_WINDOW_CAP> {
+pub enum RecvOk<'a, TL: TransportLayer<SendData>, P, SendData, RecvData, const CAP: usize = DEFAULT_WINDOW_CAP> {
+    Payload {
+        reply_guard: ReplyGuard<'a, TL, SendData, RecvData, CAP>,
+        recv_data: P,
+    },
+    Reply {
+        reply_guard: ReplyGuard<'a, TL, SendData, RecvData, CAP>,
+        recv_data: P,
+        send_data: SendData,
+    },
+    Ack {
+        send_data: SendData,
+    },
+}
+impl<'a, TL: TransportLayer<SendData>, P: std::fmt::Debug, SendData: std::fmt::Debug, RecvData, const CAP: usize> std::fmt::Debug
+    for RecvOk<'a, TL, P, SendData, RecvData, CAP>
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Payload { reply_guard, recv_data } => f
+                .debug_struct("Payload")
+                .field("reply_guard", reply_guard)
+                .field("recv_data", recv_data)
+                .finish(),
+            Self::Reply { reply_guard, recv_data, send_data } => f
+                .debug_struct("Reply")
+                .field("reply_guard", reply_guard)
+                .field("recv_data", recv_data)
+                .field("send_data", send_data)
+                .finish(),
+            Self::Ack { send_data } => f.debug_struct("Ack").field("send_data", send_data).finish(),
+        }
+    }
+}
+impl<'a, TL: TransportLayer<SendData>, P, SendData, RecvData, const CAP: usize> RecvOk<'a, TL, P, SendData, RecvData, CAP> {
+    pub fn from_raw(seq: &'a SeqExSync<SendData, RecvData, CAP>, app: TL, value: RecvOkRaw<SendData, P>) -> Self {
+        match value {
+            RecvOkRaw::Payload { reply_no, recv_data } => RecvOk::Payload { reply_guard: ReplyGuard { seq, app, reply_no }, recv_data },
+            RecvOkRaw::Reply { reply_no, recv_data, send_data } => RecvOk::Reply {
+                reply_guard: ReplyGuard { seq, app, reply_no },
+                recv_data,
+                send_data,
+            },
+            RecvOkRaw::Ack { send_data } => RecvOk::Ack { send_data },
+        }
+    }
+    pub fn consume(self) -> (Option<(ReplyGuard<'a, TL, SendData, RecvData, CAP>, P)>, Option<SendData>) {
+        match self {
+            RecvOk::Payload { reply_guard, recv_data } => (Some((reply_guard, recv_data)), None),
+            RecvOk::Reply { reply_guard, recv_data, send_data } => (Some((reply_guard, recv_data)), Some(send_data)),
+            RecvOk::Ack { send_data } => (None, Some(send_data)),
+        }
+    }
+    pub fn new(recv_data: Option<(ReplyGuard<'a, TL, SendData, RecvData, CAP>, P)>, send_data: Option<SendData>) -> Option<Self> {
+        match (recv_data, send_data) {
+            (Some((reply_guard, recv_data)), None) => Some(RecvOk::Payload { reply_guard, recv_data }),
+            (Some((reply_guard, recv_data)), Some(send_data)) => Some(RecvOk::Reply { reply_guard, recv_data, send_data }),
+            (None, Some(send_data)) => Some(RecvOk::Ack { send_data }),
+            (None, None) => None,
+        }
+    }
+}
+impl<'a, TL: TransportLayer<SendData>, P: Into<RecvData>, SendData, RecvData, const CAP: usize> RecvOk<'a, TL, P, SendData, RecvData, CAP> {
+    pub fn into(self) -> RecvOk<'a, TL, RecvData, SendData, RecvData, CAP> {
+        match self {
+            RecvOk::Payload { reply_guard, recv_data } => RecvOk::Payload { reply_guard, recv_data: recv_data.into() },
+            RecvOk::Reply { reply_guard, recv_data, send_data } => RecvOk::Reply { reply_guard, recv_data: recv_data.into(), send_data },
+            RecvOk::Ack { send_data } => RecvOk::Ack { send_data },
+        }
+    }
+}
+
+pub struct ReplyIter<'a, TL: TransportLayer<SendData>, P: Into<RecvData>, SendData, RecvData, const CAP: usize = DEFAULT_WINDOW_CAP> {
     origin: Option<&'a SeqExSync<SendData, RecvData, CAP>>,
     app: TL,
-    first: Option<RecvSuccess<'a, TL, RecvData, SendData, RecvData, CAP>>,
+    first: Option<RecvOk<'a, TL, P, SendData, RecvData, CAP>>,
 }
 
 pub struct SeqExGuard<'a, SendData, RecvData, const CAP: usize>(MutexGuard<'a, (SeqEx<SendData, RecvData, CAP>, usize)>);
@@ -81,42 +152,30 @@ impl<SendData, RecvData, const CAP: usize> SeqExSync<SendData, RecvData, CAP> {
     pub fn receive<TL: TransportLayer<SendData>, P: Into<RecvData>>(
         &self,
         app: TL,
-        seq_no: SeqNo,
-        reply_no: Option<SeqNo>,
-        packet: P,
-    ) -> Result<RecvSuccess<'_, TL, P, SendData, RecvData, CAP>, Error> {
+        packet: Packet<P>,
+    ) -> Result<RecvOk<'_, TL, P, SendData, RecvData, CAP>, Error> {
         let mut seq = self.seq_ex.lock().unwrap();
-        let ret = seq.0.receive_raw(app.clone(), seq_no, reply_no, packet);
+        let ret = seq.0.receive_raw(app.clone(), packet);
         if seq.1 > 0 && ret.is_ok() {
             self.send_block.notify_one();
         }
-        ret.map(|(reply_no, packet, send_data)| RecvSuccess {
-            guard: ReplyGuard { origin: self, app, reply_no },
-            packet,
-            send_data,
-        })
+        ret.map(|r| RecvOk::from_raw(self, app, r))
     }
-    pub fn pump<TL: TransportLayer<SendData>>(&self, app: TL) -> Result<RecvSuccess<'_, TL, RecvData, SendData, RecvData, CAP>, Error> {
+    pub fn pump<TL: TransportLayer<SendData>>(&self, app: TL) -> Result<RecvOk<'_, TL, RecvData, SendData, RecvData, CAP>, Error> {
         let mut seq = self.seq_ex.lock().unwrap();
         let ret = seq.0.pump_raw();
         if seq.1 > 0 && ret.is_ok() {
             self.send_block.notify_one();
         }
-        ret.map(|(reply_no, packet, send_data)| RecvSuccess {
-            guard: ReplyGuard { origin: self, app, reply_no },
-            packet,
-            send_data,
-        })
+        ret.map(|r| RecvOk::from_raw(self, app, r))
     }
-    pub fn receive_all<TL: TransportLayer<SendData>>(
+    pub fn receive_all<TL: TransportLayer<SendData>, P: Into<RecvData>>(
         &self,
         app: TL,
-        seq_no: SeqNo,
-        reply_no: Option<SeqNo>,
-        packet: RecvData,
-    ) -> ReplyIter<'_, TL, SendData, RecvData, CAP> {
-        if let Ok(g) = self.receive(app.clone(), seq_no, reply_no, packet) {
-            ReplyIter { origin: Some(self), app, first: Some(g) }
+        packet: Packet<P>,
+    ) -> ReplyIter<'_, TL, P, SendData, RecvData, CAP> {
+        if let Ok(r) = self.receive(app.clone(), packet) {
+            ReplyIter { origin: Some(self), app, first: Some(r) }
         } else {
             ReplyIter { origin: None, app, first: None }
         }
@@ -151,15 +210,6 @@ impl<SendData, RecvData, const CAP: usize> SeqExSync<SendData, RecvData, CAP> {
         let seq_no = seq.0.seq_no();
         self.send_inner(seq, app, packet_data(seq_no))
     }
-
-    pub fn receive_ack(&self, reply_no: SeqNo) -> Result<SendData, Error> {
-        let mut seq = self.seq_ex.lock().unwrap();
-        let ret = seq.0.receive_ack(reply_no);
-        if seq.1 > 0 && ret.is_ok() {
-            self.send_block.notify_one();
-        }
-        ret
-    }
     pub fn service<TL: TransportLayer<SendData>>(&self, app: TL) -> i64 {
         self.lock().service(app)
     }
@@ -174,11 +224,18 @@ impl<SendData, RecvData, const CAP: usize> Default for SeqExSync<SendData, RecvD
     }
 }
 
-impl<'a, TL: TransportLayer<SendData>, SendData, RecvData, const CAP: usize> Iterator for ReplyIter<'a, TL, SendData, RecvData, CAP> {
-    type Item = RecvSuccess<'a, TL, RecvData, SendData, RecvData, CAP>;
+impl<'a, TL: TransportLayer<SendData>, P: Into<RecvData>, SendData, RecvData, const CAP: usize> ReplyIter<'a, TL, P, SendData, RecvData, CAP> {
+    pub fn take_first(&mut self) -> Option<RecvOk<'a, TL, P, SendData, RecvData, CAP>> {
+        self.first.take()
+    }
+}
+impl<'a, TL: TransportLayer<SendData>, P: Into<RecvData>, SendData, RecvData, const CAP: usize> Iterator
+    for ReplyIter<'a, TL, P, SendData, RecvData, CAP>
+{
+    type Item = RecvOk<'a, TL, RecvData, SendData, RecvData, CAP>;
     fn next(&mut self) -> Option<Self::Item> {
         if let Some(g) = self.first.take() {
-            Some(g)
+            Some(g.into())
         } else if let Some(origin) = self.origin {
             origin.pump(self.app.clone()).ok()
         } else {
@@ -187,35 +244,20 @@ impl<'a, TL: TransportLayer<SendData>, SendData, RecvData, const CAP: usize> Ite
     }
 }
 
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[derive(Clone)]
-pub enum PacketOwned<Payload: Clone> {
-    Payload(SeqNo, Option<SeqNo>, Payload),
-    Ack(SeqNo),
-}
-impl<'a, Payload: Clone> From<Packet<'a, Payload>> for PacketOwned<Payload> {
-    fn from(value: Packet<'a, Payload>) -> Self {
-        match value {
-            Packet::Payload { seq_no, reply_no, data } => PacketOwned::Payload(seq_no, reply_no, data.clone()),
-            Packet::Ack { reply_no } => PacketOwned::Ack(reply_no),
-        }
-    }
-}
-
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct MpscTransport<Payload: Clone> {
-    pub channel: Sender<PacketOwned<Payload>>,
+    pub channel: Sender<Packet<Payload>>,
     pub time: Instant,
 }
 pub type MpscGuard<'a, Packet> = ReplyGuard<'a, &'a MpscTransport<Packet>, Packet, Packet>;
 pub type MpscSeqEx<Packet> = SeqExSync<Packet, Packet>;
 
 impl<Payload: Clone> MpscTransport<Payload> {
-    pub fn new() -> (Self, Receiver<PacketOwned<Payload>>) {
+    pub fn new() -> (Self, Receiver<Packet<Payload>>) {
         let (send, recv) = channel();
         (Self { channel: send, time: std::time::Instant::now() }, recv)
     }
-    pub fn from_sender(send: Sender<PacketOwned<Payload>>) -> Self {
+    pub fn from_sender(send: Sender<Packet<Payload>>) -> Self {
         Self { channel: send, time: std::time::Instant::now() }
     }
 }
@@ -224,7 +266,7 @@ impl<Payload: Clone> TransportLayer<Payload> for &MpscTransport<Payload> {
         self.time.elapsed().as_millis() as i64
     }
 
-    fn send(&mut self, packet: Packet<'_, Payload>) {
-        let _ = self.channel.send(PacketOwned::from(packet));
+    fn send(&mut self, packet: Packet<&Payload>) {
+        let _ = self.channel.send(packet.cloned());
     }
 }

@@ -11,14 +11,14 @@ use std::{
 
 use rand_core::{OsRng, RngCore};
 use seq_ex::{
-    sync::{PacketOwned, RecvSuccess, ReplyGuard, SeqExSync},
-    TransportLayer,
+    sync::{RecvOk, SeqExSync},
+    Packet, TransportLayer,
 };
 use serde::{Deserialize, Serialize};
 
 const FILE_CHUNK_SIZE: usize = 1000;
 #[derive(Clone, Debug, Serialize, Deserialize)]
-enum Packet {
+enum Payload {
     RequestFile { filename: String },
     ConfirmRequestFile { filesize: u64 },
     FileDownload { filename: String, file_chunk: Vec<u8> },
@@ -32,18 +32,17 @@ struct Transport {
 struct Peer {
     filesystem: Arc<RwLock<HashMap<String, Vec<u8>>>>,
     transport: Transport,
-    seqex: Arc<SeqExSync<Packet, Packet>>,
+    seqex: Arc<SeqExSync<Payload, Payload>>,
     receiver: Receiver<Vec<u8>>,
 }
 
-impl TransportLayer<Packet> for &Transport {
+impl TransportLayer<Payload> for &Transport {
     fn time(&mut self) -> i64 {
         self.time.elapsed().as_millis() as i64
     }
 
-    fn send(&mut self, packet: seq_ex::Packet<'_, Packet>) {
-        let p = PacketOwned::from(packet);
-        if let Ok(p) = serde_json::to_vec(&p) {
+    fn send(&mut self, packet: Packet<&Payload>) {
+        if let Ok(p) = serde_json::to_vec(&packet) {
             let _ = self.sender.send(p);
         }
     }
@@ -53,14 +52,15 @@ fn drop_packet() -> bool {
     OsRng.next_u32() >= (u32::MAX / 4 * 3)
 }
 
-fn process(peer: &Peer, guard: ReplyGuard<'_, &Transport, Packet, Packet>, recv_packet: Packet, sent_packet: Option<Packet>) {
-    match (recv_packet, sent_packet) {
-        (Packet::RequestFile { filename }, None) => {
+fn process(peer: &Peer, recv_data: RecvOk<'_, &Transport, Payload, Payload, Payload>) {
+    use Payload::*;
+    match recv_data.consume() {
+        (Some((guard, RequestFile { filename })), None) => {
             let filesystem = peer.filesystem.clone();
             let transport = peer.transport.clone();
             let seqex = peer.seqex.clone();
             if let Some(file) = filesystem.read().unwrap().get(&filename) {
-                guard.reply(Packet::ConfirmRequestFile { filesize: file.len() as u64 });
+                guard.reply(ConfirmRequestFile { filesize: file.len() as u64 });
             }
             thread::spawn(move || {
                 let filesystem = filesystem.read().unwrap();
@@ -70,21 +70,18 @@ fn process(peer: &Peer, guard: ReplyGuard<'_, &Transport, Packet, Packet>, recv_
                     let mut i = 0;
                     while i < file.len() {
                         let j = file.len().min(i + FILE_CHUNK_SIZE);
-                        seqex.send(
-                            &transport,
-                            Packet::FileDownload { filename: filename.clone(), file_chunk: file[i..j].to_vec() },
-                        );
+                        seqex.send(&transport, FileDownload { filename: filename.clone(), file_chunk: file[i..j].to_vec() });
                         i = j;
                     }
                 }
             });
         }
-        (Packet::ConfirmRequestFile { filesize }, Some(Packet::RequestFile { filename })) => {
+        (Some((_, ConfirmRequestFile { filesize })), Some(RequestFile { filename })) => {
             let mut filesystem = peer.filesystem.write().unwrap();
             let file = Vec::with_capacity(filesize as usize);
             filesystem.insert(filename, file);
         }
-        (Packet::FileDownload { filename, file_chunk }, None) => {
+        (Some((_, FileDownload { filename, file_chunk })), None) => {
             let mut filesystem = peer.filesystem.write().unwrap();
             if let Some(file) = filesystem.get_mut(&filename) {
                 if file.len() + file_chunk.len() <= file.capacity() {
@@ -92,9 +89,10 @@ fn process(peer: &Peer, guard: ReplyGuard<'_, &Transport, Packet, Packet>, recv_
                 }
             }
         }
-        _ => {
-            assert!(false);
+        (Some(a), b) => {
+            print!("Unsolicited packet received: {:?}", RecvOk::new(Some(a), b));
         }
+        _ => {}
     }
 }
 
@@ -103,17 +101,10 @@ fn receive(peer: &Peer) {
         if drop_packet() {
             continue;
         }
-        let parsed_packet = serde_json::from_slice::<PacketOwned<Packet>>(&packet);
-        match parsed_packet {
-            Ok(PacketOwned::Ack(reply_no)) => {
-                let _ = peer.seqex.receive_ack(reply_no);
+        if let Ok(parsed_packet) = serde_json::from_slice::<Packet<Payload>>(&packet) {
+            for recv_data in peer.seqex.receive_all(&peer.transport, parsed_packet) {
+                process(peer, recv_data);
             }
-            Ok(PacketOwned::Payload(seq_no, reply_no, payload)) => {
-                for RecvSuccess { guard, packet, send_data } in peer.seqex.receive_all(&peer.transport, seq_no, reply_no, payload) {
-                    process(peer, guard, packet, send_data);
-                }
-            }
-            _ => {}
         }
     }
 }
@@ -146,9 +137,9 @@ fn main() {
         receiver: recv2,
     };
 
-    peer1.seqex.send(&peer1.transport, Packet::RequestFile { filename: "File1".to_string() });
-    peer1.seqex.send(&peer1.transport, Packet::RequestFile { filename: "File3".to_string() });
-    peer1.seqex.send(&peer1.transport, Packet::RequestFile { filename: "File2".to_string() });
+    peer1.seqex.send(&peer1.transport, Payload::RequestFile { filename: "File1".to_string() });
+    peer1.seqex.send(&peer1.transport, Payload::RequestFile { filename: "File3".to_string() });
+    peer1.seqex.send(&peer1.transport, Payload::RequestFile { filename: "File2".to_string() });
 
     for _ in 0..300 {
         receive(&peer1);

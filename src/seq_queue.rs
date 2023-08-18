@@ -105,14 +105,47 @@ pub enum Error {
     WindowIsFull,
 }
 
-pub enum Packet<'a, SendData> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum Packet<RecvData> {
+    Payload(SeqNo, RecvData),
+    Reply(SeqNo, SeqNo, RecvData),
+    Ack(SeqNo),
+}
+impl<RecvData> Packet<RecvData> {
+    pub fn as_ref(&self) -> Packet<&RecvData> {
+        match self {
+            Packet::Payload(seq_no, data) => Packet::Payload(*seq_no, data),
+            Packet::Reply(seq_no, reply_no, data) => Packet::Reply(*seq_no, *reply_no, data),
+            Packet::Ack(reply_no) => Packet::Ack(*reply_no),
+        }
+    }
+    pub fn map<SendData>(self, f: impl FnOnce(RecvData) -> SendData) -> Packet<SendData> {
+        match self {
+            Packet::Payload(seq_no, data) => Packet::Payload(seq_no, f(data)),
+            Packet::Reply(seq_no, reply_no, data) => Packet::Reply(seq_no, reply_no, f(data)),
+            Packet::Ack(reply_no) => Packet::Ack(reply_no),
+        }
+    }
+}
+impl<RecvData: Clone> Packet<&RecvData> {
+    pub fn cloned(&self) -> Packet<RecvData> {
+        self.map(|d| d.clone())
+    }
+}
+
+pub enum RecvOkRaw<SendData, RecvData> {
     Payload {
-        seq_no: SeqNo,
-        reply_no: Option<SeqNo>,
-        data: &'a SendData,
+        reply_no: SeqNo,
+        recv_data: RecvData,
+    },
+    Reply {
+        reply_no: SeqNo,
+        recv_data: RecvData,
+        send_data: SendData,
     },
     Ack {
-        reply_no: SeqNo,
+        send_data: SendData,
     },
 }
 
@@ -232,7 +265,7 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
     /// user would like. However this choice of units must be consistent with the units of the
     /// `retry_interval`. `current_time` does not have to be monotonically increasing.
     #[must_use = "The queue might be full causing the packet to not be sent"]
-    pub fn try_send_direct(&mut self, packet_data: SendData, current_time: i64) -> Result<Packet<'_, SendData>, SendData> {
+    pub fn try_send_direct(&mut self, packet_data: SendData, current_time: i64) -> Result<Packet<&SendData>, SendData> {
         if self.is_full() {
             return Err(packet_data);
         }
@@ -247,20 +280,21 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
         debug_assert!(slot.is_none());
         let entry = slot.insert(SendEntry { seq_no, reply_no: None, next_resend_time, data: packet_data });
 
-        Ok(Packet::Payload {
-            seq_no: entry.seq_no,
-            reply_no: entry.reply_no,
-            data: &entry.data,
-        })
+        Ok(Packet::Payload(entry.seq_no, &entry.data))
     }
 
     /// If this returns `Ok` then `try_send` might succeed on next call.
-    pub fn receive_raw_and_direct<P: Into<RecvData>>(
-        &mut self,
-        seq_no: SeqNo,
-        reply_no: Option<SeqNo>,
-        packet: P,
-    ) -> Result<(SeqNo, P, Option<SendData>), DirectError> {
+    pub fn receive_raw_and_direct<P: Into<RecvData>>(&mut self, packet: Packet<P>) -> Result<RecvOkRaw<SendData, P>, DirectError> {
+        let (seq_no, reply_no, recv_data) = match packet {
+            Packet::Payload(seq_no, recv_data) => (seq_no, None, recv_data),
+            Packet::Reply(seq_no, reply_no, recv_data) => (seq_no, Some(reply_no), recv_data),
+            Packet::Ack(reply_no) => {
+                return self
+                    .take_send(reply_no)
+                    .map(|send_data| RecvOkRaw::Ack { send_data })
+                    .ok_or(DirectError::OutOfSequence)
+            }
+        };
         // We only want to accept packets with sequence numbers in the range:
         // `self.pre_recv_seq_no < seq_no <= self.pre_recv_seq_no + self.recv_window.len()`.
         // To check that range we compute `seq_no - (self.pre_recv_seq_no + 1)` and check
@@ -320,10 +354,13 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
             self.pre_recv_seq_no = seq_no;
             self.concurrent_replies[self.concurrent_replies_total] = seq_no;
             self.concurrent_replies_total += 1;
-            let data = reply_no.and_then(|r| self.take_send(r));
-            Ok((seq_no, packet, data))
+            return Ok(if let Some(send_data) = reply_no.and_then(|r| self.take_send(r)) {
+                RecvOkRaw::Reply { reply_no: seq_no, recv_data, send_data }
+            } else {
+                RecvOkRaw::Payload { reply_no: seq_no, recv_data }
+            });
         } else {
-            self.recv_window[i] = Some(RecvEntry { seq_no, reply_no, data: packet.into() });
+            self.recv_window[i] = Some(RecvEntry { seq_no, reply_no, data: recv_data.into() });
             if is_full {
                 Err(DirectError::WindowIsFull)
             } else {
@@ -332,11 +369,7 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
         }
     }
     /// If this returns `Ok` then `try_send` might succeed on next call.
-    pub fn receive_ack(&mut self, reply_no: SeqNo) -> Result<SendData, Error> {
-        self.take_send(reply_no).ok_or(Error::OutOfSequence)
-    }
-    /// If this returns `Ok` then `try_send` might succeed on next call.
-    pub fn pump_raw(&mut self) -> Result<(SeqNo, RecvData, Option<SendData>), Error> {
+    pub fn pump_raw(&mut self) -> Result<RecvOkRaw<SendData, RecvData>, Error> {
         let next_seq_no = self.pre_recv_seq_no.wrapping_add(1);
         let i = next_seq_no as usize % self.recv_window.len();
 
@@ -349,8 +382,11 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
             self.pre_recv_seq_no = next_seq_no;
             self.concurrent_replies[self.concurrent_replies_total] = entry.seq_no;
             self.concurrent_replies_total += 1;
-            let data = entry.reply_no.and_then(|r| self.take_send(r));
-            Ok((entry.seq_no, entry.data, data))
+            return Ok(if let Some(send_data) = entry.reply_no.and_then(|r| self.take_send(r)) {
+                RecvOkRaw::Reply { reply_no: entry.seq_no, recv_data: entry.data, send_data }
+            } else {
+                RecvOkRaw::Payload { reply_no: entry.seq_no, recv_data: entry.data }
+            });
         } else {
             Err(Error::OutOfSequence)
         }
@@ -364,7 +400,7 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
     /// and since each fragment will be received in order it will be trivial for them to reconstruct
     /// the original file.
     #[must_use]
-    pub fn reply_raw_and_direct(&mut self, reply_no: SeqNo, packet_data: SendData, current_time: i64) -> Option<Packet<'_, SendData>> {
+    pub fn reply_raw_and_direct(&mut self, reply_no: SeqNo, packet_data: SendData, current_time: i64) -> Option<Packet<&SendData>> {
         if self.remove_reservation(reply_no) {
             let seq_no = self.next_send_seq_no;
             self.next_send_seq_no = self.next_send_seq_no.wrapping_add(1);
@@ -382,24 +418,20 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
                 data: packet_data,
             });
 
-            Some(Packet::Payload {
-                seq_no: entry.seq_no,
-                reply_no: entry.reply_no,
-                data: &entry.data,
-            })
+            Some(Packet::Reply(entry.seq_no, reply_no, &entry.data))
         } else {
             None
         }
     }
-    pub fn ack_raw_and_direct(&mut self, reply_no: SeqNo) -> Option<Packet<'_, SendData>> {
+    pub fn ack_raw_and_direct(&mut self, reply_no: SeqNo) -> Option<Packet<&SendData>> {
         if self.remove_reservation(reply_no) {
-            Some(Packet::Ack { reply_no })
+            Some(Packet::Ack(reply_no))
         } else {
             None
         }
     }
 
-    pub fn service_direct<'a>(&'a mut self, current_time: i64, iter: &mut Option<ServiceIter>) -> Option<Packet<'a, SendData>> {
+    pub fn service_direct<'a>(&'a mut self, current_time: i64, iter: &mut Option<ServiceIter>) -> Option<Packet<&SendData>> {
         if self.next_service_timestamp <= current_time {
             let iter = iter.get_or_insert(ServiceIter { idx: 0, next_time: i64::MAX });
             while let Some(entry) = self.send_window.get(iter.idx) {
@@ -409,10 +441,10 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
                         let entry = self.send_window[iter.idx - 1].as_mut().unwrap();
                         entry.next_resend_time = current_time + self.resend_interval;
                         iter.next_time = iter.next_time.min(entry.next_resend_time);
-                        return Some(Packet::Payload {
-                            seq_no: entry.seq_no,
-                            reply_no: entry.reply_no,
-                            data: &entry.data,
+                        return Some(if let Some(reply_no) = entry.reply_no {
+                            Packet::Reply(entry.seq_no, reply_no, &entry.data)
+                        } else {
+                            Packet::Payload(entry.seq_no, &entry.data)
                         });
                     } else {
                         iter.next_time = iter.next_time.min(entry.next_resend_time);

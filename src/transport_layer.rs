@@ -9,5 +9,5 @@ use crate::Packet;
 pub trait TransportLayer<SendData>: Clone {
     fn time(&mut self) -> i64;
 
-    fn send(&mut self, packet: Packet<'_, SendData>);
+    fn send(&mut self, packet: Packet<&SendData>);
 }

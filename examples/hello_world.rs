@@ -1,55 +1,46 @@
 use std::sync::mpsc::Receiver;
 
-use seq_ex::sync::{MpscGuard, MpscSeqEx, MpscTransport, PacketOwned, RecvSuccess};
+use seq_ex::{
+    sync::{MpscSeqEx, MpscTransport, RecvOk},
+    Packet,
+};
 
 #[derive(Clone, Debug)]
-enum Packet {
+enum Payload {
     Hello,
     Space,
     World,
     Exclamation,
 }
-use Packet::*;
+use Payload::*;
 
-fn process(guard: MpscGuard<'_, Packet>, recv_packet: Packet, send_packet: Option<Packet>) {
-    match (recv_packet, send_packet) {
-        (Hello, None) => {
-            print!("Hello");
-            guard.reply(Space);
-        }
-        (Space, Some(Hello)) => {
-            print!(" ");
-            guard.reply(World);
-        }
-        (World, Some(Space)) => {
-            print!("World");
-            guard.reply(Exclamation);
-        }
-        (Exclamation, Some(World)) => {
-            print!("!");
-        }
-        (a, None) => {
-            print!("Unsolicited packet received: {:?}", a);
-        }
-        (a, Some(b)) => {
-            print!("Incorrect reply received: {:?}, was a reply to: {:?}", a, b);
-        }
-    }
-}
-
-fn receive(recv: &Receiver<PacketOwned<Packet>>, seq: &MpscSeqEx<Packet>, transport: &MpscTransport<Packet>) {
-    match recv.recv().unwrap() {
-        PacketOwned::Ack(reply_no) => {
-            let result = seq.receive_ack(reply_no);
-            if let Ok(Exclamation) = result {
+fn receive(recv: &Receiver<Packet<Payload>>, seq: &MpscSeqEx<Payload>, transport: &MpscTransport<Payload>) {
+    let packet = recv.recv().unwrap();
+    for recv_data in seq.receive_all(transport, packet) {
+        match recv_data.consume() {
+            (Some((guard, Hello)), None) => {
+                print!("Hello");
+                guard.reply(Space);
+            }
+            (Some((guard, Space)), Some(Hello)) => {
+                print!(" ");
+                guard.reply(World);
+            }
+            (Some((guard, World)), Some(Space)) => {
+                print!("World");
+                guard.reply(Exclamation);
+            }
+            (Some((_, Exclamation)), Some(World)) => {
+                print!("!");
+            }
+            (None, Some(Exclamation)) => {
                 // Our Hello World exchange ends right here.
                 print!("\n");
             }
-        }
-        PacketOwned::Payload(seq_no, reply_no, payload) => {
-            for RecvSuccess { guard, packet, send_data } in seq.receive_all(transport, seq_no, reply_no, payload) {
-                process(guard, packet, send_data)
+            (Some(a), b) => {
+                print!("Unsolicited packet received: {:?}", RecvOk::new(Some(a), b));
             }
+            _ => {}
         }
     }
 }
@@ -61,7 +52,7 @@ fn main() {
     let seq2 = MpscSeqEx::default();
 
     // We begin a "Hello World" exchange right here.
-    seq1.send(&transport1, Packet::Hello);
+    seq1.send(&transport1, Payload::Hello);
 
     receive(&recv2, &seq2, &transport2);
     receive(&recv1, &seq1, &transport1);
