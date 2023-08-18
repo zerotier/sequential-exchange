@@ -255,7 +255,7 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
     }
 
     /// If this returns `Ok` then `try_send` might succeed on next call.
-    pub fn receive_direct<P: Into<RecvData>>(
+    pub fn receive_raw_and_direct<P: Into<RecvData>>(
         &mut self,
         seq_no: SeqNo,
         reply_no: Option<SeqNo>,
@@ -364,7 +364,7 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
     /// and since each fragment will be received in order it will be trivial for them to reconstruct
     /// the original file.
     #[must_use]
-    pub fn reply_direct(&mut self, reply_no: SeqNo, packet_data: SendData, current_time: i64) -> Option<Packet<'_, SendData>> {
+    pub fn reply_raw_and_direct(&mut self, reply_no: SeqNo, packet_data: SendData, current_time: i64) -> Option<Packet<'_, SendData>> {
         if self.remove_reservation(reply_no) {
             let seq_no = self.next_send_seq_no;
             self.next_send_seq_no = self.next_send_seq_no.wrapping_add(1);
@@ -391,7 +391,7 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
             None
         }
     }
-    pub fn ack_direct(&mut self, reply_no: SeqNo) -> Option<Packet<'_, SendData>> {
+    pub fn ack_raw_and_direct(&mut self, reply_no: SeqNo) -> Option<Packet<'_, SendData>> {
         if self.remove_reservation(reply_no) {
             Some(Packet::Ack { reply_no })
         } else {

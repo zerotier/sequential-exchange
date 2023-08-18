@@ -21,7 +21,7 @@ impl<'a, TL: TransportLayer<SendData>, SendData, RecvData, const CAP: usize> Rep
 impl<'a, TL: TransportLayer<SendData>, SendData, RecvData, const CAP: usize> Drop for ReplyGuard<'a, TL, SendData, RecvData, CAP> {
     fn drop(&mut self) {
         if let Some(app) = &mut self.1 {
-            if let Some(p) = self.0.ack_direct(self.2) {
+            if let Some(p) = self.0.ack_raw_and_direct(self.2) {
                 app.send(p)
             }
         }
@@ -52,7 +52,7 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
         reply_no: Option<SeqNo>,
         packet: P,
     ) -> Result<(SeqNo, P, Option<SendData>), Error> {
-        match self.receive_direct(seq_no, reply_no, packet) {
+        match self.receive_raw_and_direct(seq_no, reply_no, packet) {
             Ok(a) => Ok(a),
             Err(DirectError::ResendAck(reply_no)) => {
                 app.send(Packet::Ack { reply_no });
@@ -63,12 +63,12 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
         }
     }
     pub fn reply_raw(&mut self, mut app: impl TransportLayer<SendData>, reply_no: SeqNo, packet_data: SendData) {
-        if let Some(p) = self.reply_direct(reply_no, packet_data, app.time()) {
+        if let Some(p) = self.reply_raw_and_direct(reply_no, packet_data, app.time()) {
             app.send(p)
         }
     }
     pub fn ack_raw(&mut self, mut app: impl TransportLayer<SendData>, reply_no: SeqNo) {
-        if let Some(p) = self.ack_direct(reply_no) {
+        if let Some(p) = self.ack_raw_and_direct(reply_no) {
             app.send(p)
         }
     }
