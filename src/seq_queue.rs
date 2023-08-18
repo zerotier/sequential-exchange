@@ -65,11 +65,13 @@ pub struct SeqEx<SendData, RecvData, const CAP: usize = DEFAULT_WINDOW_CAP> {
     /// when `reply_raw` or `ack_raw` are called with it, they are guaranteed not to fail.
     /// To accomplish this we must track all issued reply numbers.
     concurrent_replies_total: usize,
+    is_locked: bool,
 }
 
 struct RecvEntry<RecvData> {
     seq_no: SeqNo,
     reply_no: Option<SeqNo>,
+    locked: bool,
     data: RecvData,
 }
 
@@ -80,51 +82,99 @@ struct SendEntry<SendData> {
     data: SendData,
 }
 
-/// The error type for when a packet has been received, but for whatever reason could not be
-/// immediately processed.
-#[derive(Debug, Clone)]
-pub enum DirectError {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DirectError<RecvData> {
     /// The packet is out-of-sequence. It was either received too soon or too late and so it would be
     /// invalid to process it right now. No action needs to be taken by the caller.
     OutOfSequence,
     /// The Send Window is currently full. The received packet cannot be processed right now because
     /// it could cause the send window to overflow. No action needs to be taken by the caller.
-    WindowIsFull,
+    WindowIsFull(Packet<RecvData>),
+    WindowIsLocked(Packet<RecvData>),
     ResendAck(SeqNo),
 }
 
-/// The error type for when a packet has been received, but for whatever reason could not be
-/// immediately processed.
-#[derive(Debug, Clone)]
-pub enum Error {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PumpError {
     /// The packet is out-of-sequence. It was either received too soon or too late and so it would be
     /// invalid to process it right now. No action needs to be taken by the caller.
     OutOfSequence,
     /// The Send Window is currently full. The received packet cannot be processed right now because
     /// it could cause the send window to overflow. No action needs to be taken by the caller.
     WindowIsFull,
+    WindowIsLocked,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Packet<RecvData> {
     Payload(SeqNo, RecvData),
+    LockPayload(SeqNo, RecvData),
     Reply(SeqNo, SeqNo, RecvData),
+    LockReply(SeqNo, SeqNo, RecvData),
     Ack(SeqNo),
 }
+use Packet::*;
 impl<RecvData> Packet<RecvData> {
+    pub fn new_with_data(seq_no: SeqNo, reply_no: Option<SeqNo>, is_locking: bool, data: RecvData) -> Self {
+        Self::new(Some(seq_no), reply_no, is_locking, Some(data)).unwrap()
+    }
+    pub fn new(seq_no: Option<SeqNo>, reply_no: Option<SeqNo>, is_locking: bool, data: Option<RecvData>) -> Option<Self> {
+        match (seq_no, reply_no, is_locking, data) {
+            (Some(s), None, false, Some(d)) => Some(Payload(s, d)),
+            (Some(s), None, true, Some(d)) => Some(LockPayload(s, d)),
+            (Some(s), Some(r), false, Some(d)) => Some(Reply(s, r, d)),
+            (Some(s), Some(r), true, Some(d)) => Some(LockReply(s, r, d)),
+            (None, Some(r), false, None) => Some(Ack(r)),
+            _ => None,
+        }
+    }
     pub fn as_ref(&self) -> Packet<&RecvData> {
         match self {
-            Packet::Payload(seq_no, data) => Packet::Payload(*seq_no, data),
-            Packet::Reply(seq_no, reply_no, data) => Packet::Reply(*seq_no, *reply_no, data),
-            Packet::Ack(reply_no) => Packet::Ack(*reply_no),
+            Payload(seq_no, data) => Payload(*seq_no, data),
+            LockPayload(seq_no, data) => LockPayload(*seq_no, data),
+            Reply(seq_no, reply_no, data) => Reply(*seq_no, *reply_no, data),
+            LockReply(seq_no, reply_no, data) => LockReply(*seq_no, *reply_no, data),
+            Ack(reply_no) => Ack(*reply_no),
         }
     }
     pub fn map<SendData>(self, f: impl FnOnce(RecvData) -> SendData) -> Packet<SendData> {
         match self {
-            Packet::Payload(seq_no, data) => Packet::Payload(seq_no, f(data)),
-            Packet::Reply(seq_no, reply_no, data) => Packet::Reply(seq_no, reply_no, f(data)),
-            Packet::Ack(reply_no) => Packet::Ack(reply_no),
+            Payload(seq_no, data) => Payload(seq_no, f(data)),
+            LockPayload(seq_no, data) => LockPayload(seq_no, f(data)),
+            Reply(seq_no, reply_no, data) => Reply(seq_no, reply_no, f(data)),
+            LockReply(seq_no, reply_no, data) => LockReply(seq_no, reply_no, f(data)),
+            Ack(reply_no) => Ack(reply_no),
+        }
+    }
+    pub fn payload(self) -> Option<RecvData> {
+        match self {
+            Payload(_, data) | LockPayload(_, data) | Reply(_, _, data) | LockReply(_, _, data) => Some(data),
+            Ack(_) => None,
+        }
+    }
+    pub fn is_locking(&self) -> bool {
+        matches!(self, LockPayload(..) | LockReply(..))
+    }
+    pub fn set_locking(&mut self, locking: bool) {
+        let mut tmp = Ack(0);
+        core::mem::swap(&mut tmp, self);
+        match tmp {
+            Payload(seq_no, data) | LockPayload(seq_no, data) => {
+                *self = if locking {
+                    LockPayload(seq_no, data)
+                } else {
+                    Payload(seq_no, data)
+                }
+            }
+            Reply(seq_no, reply_no, data) | LockReply(seq_no, reply_no, data) => {
+                *self = if locking {
+                    LockReply(seq_no, reply_no, data)
+                } else {
+                    Reply(seq_no, reply_no, data)
+                }
+            }
+            Ack(reply_no) => *self = Ack(reply_no),
         }
     }
 }
@@ -137,10 +187,12 @@ impl<RecvData: Clone> Packet<&RecvData> {
 pub enum RecvOkRaw<SendData, RecvData> {
     Payload {
         reply_no: SeqNo,
+        locked: bool,
         recv_data: RecvData,
     },
     Reply {
         reply_no: SeqNo,
+        locked: bool,
         recv_data: RecvData,
         send_data: SendData,
     },
@@ -190,6 +242,7 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
             send_window: core::array::from_fn(|_| None),
             concurrent_replies: core::array::from_fn(|_| 0),
             concurrent_replies_total: 0,
+            is_locked: false,
         }
     }
     fn send_window_slot_mut(&mut self, seq_no: SeqNo) -> &mut Option<SendEntry<SendData>> {
@@ -264,10 +317,9 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
     /// `current_time` should be a timestamp of the current time, using whatever units of time the
     /// user would like. However this choice of units must be consistent with the units of the
     /// `retry_interval`. `current_time` does not have to be monotonically increasing.
-    #[must_use = "The queue might be full causing the packet to not be sent"]
-    pub fn try_send_direct(&mut self, packet_data: SendData, current_time: i64) -> Result<Packet<&SendData>, SendData> {
+    fn try_send_direct_inner(&mut self, current_time: i64) -> Option<(&mut Option<SendEntry<SendData>>, SeqNo, i64)> {
         if self.is_full() {
-            return Err(packet_data);
+            return None;
         }
         let seq_no = self.next_send_seq_no;
         self.next_send_seq_no = self.next_send_seq_no.wrapping_add(1);
@@ -278,16 +330,36 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
         }
         let slot = self.send_window_slot_mut(seq_no);
         debug_assert!(slot.is_none());
-        let entry = slot.insert(SendEntry { seq_no, reply_no: None, next_resend_time, data: packet_data });
-
-        Ok(Packet::Payload(entry.seq_no, &entry.data))
+        Some((slot, seq_no, next_resend_time))
+    }
+    pub fn try_send_direct(&mut self, packet_data: SendData, current_time: i64) -> Result<Packet<&SendData>, SendData> {
+        if let Some((slot, seq_no, next_resend_time)) = self.try_send_direct_inner(current_time) {
+            let entry = slot.insert(SendEntry { seq_no, reply_no: None, next_resend_time, data: packet_data });
+            Ok(Packet::Payload(entry.seq_no, &entry.data))
+        } else {
+            Err(packet_data)
+        }
+    }
+    pub fn try_send_direct_with(&mut self, packet_data: impl FnOnce(SeqNo) -> SendData, current_time: i64) -> Result<Packet<&SendData>, ()> {
+        if let Some((slot, seq_no, next_resend_time)) = self.try_send_direct_inner(current_time) {
+            let entry = slot.insert(SendEntry {
+                seq_no,
+                reply_no: None,
+                next_resend_time,
+                data: packet_data(seq_no),
+            });
+            Ok(Packet::Payload(entry.seq_no, &entry.data))
+        } else {
+            Err(())
+        }
     }
 
     /// If this returns `Ok` then `try_send` might succeed on next call.
-    pub fn receive_raw_and_direct<P: Into<RecvData>>(&mut self, packet: Packet<P>) -> Result<RecvOkRaw<SendData, P>, DirectError> {
+    pub fn receive_raw_and_direct<P: Into<RecvData>>(&mut self, packet: Packet<P>) -> Result<RecvOkRaw<SendData, P>, DirectError<P>> {
+        let locked = packet.is_locking();
         let (seq_no, reply_no, recv_data) = match packet {
-            Packet::Payload(seq_no, recv_data) => (seq_no, None, recv_data),
-            Packet::Reply(seq_no, reply_no, recv_data) => (seq_no, Some(reply_no), recv_data),
+            Packet::Payload(seq_no, recv_data) | Packet::LockPayload(seq_no, recv_data) => (seq_no, None, recv_data),
+            Packet::Reply(seq_no, reply_no, recv_data) | Packet::LockReply(seq_no, reply_no, recv_data) => (seq_no, Some(reply_no), recv_data),
             Packet::Ack(reply_no) => {
                 return self
                     .take_send(reply_no)
@@ -332,64 +404,87 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
         // We can only process this packet if processing it would make space in the send window.
         let is_full = self.is_full_inner(false);
 
+        // Check whether or not we've already received this packet
         let i = seq_no as usize % self.recv_window.len();
-        if let Some(pre) = self.recv_window[i].as_mut() {
+        let is_in_window = if let Some(pre) = self.recv_window[i].as_mut() {
             if seq_no == pre.seq_no {
-                if is_next && !is_full {
-                    self.recv_window[i] = None;
-                } else {
-                    return if is_full {
-                        Err(DirectError::WindowIsFull)
-                    } else {
-                        Err(DirectError::OutOfSequence)
-                    };
-                }
+                true
             } else {
                 // This is currently unreachable due to the range check.
                 // `self.pre_recv_seq_no < seq_no <= self.pre_recv_seq_no + self.recv_window.len()`.
                 return Err(DirectError::OutOfSequence);
             }
-        }
-        if is_next && !is_full {
+        } else {
+            false
+        };
+
+        if !is_next {
+            if !is_in_window {
+                self.recv_window[i] = Some(RecvEntry { seq_no, reply_no, locked, data: recv_data.into() })
+            }
+            Err(DirectError::OutOfSequence)
+        } else if is_full {
+            Err(DirectError::WindowIsFull(Packet::new_with_data(seq_no, reply_no, locked, recv_data)))
+        } else if locked && self.is_locked {
+            Err(DirectError::WindowIsLocked(Packet::new_with_data(seq_no, reply_no, locked, recv_data)))
+        } else {
+            if is_in_window {
+                self.recv_window[i] = None;
+            }
             self.pre_recv_seq_no = seq_no;
             self.concurrent_replies[self.concurrent_replies_total] = seq_no;
             self.concurrent_replies_total += 1;
-            return Ok(if let Some(send_data) = reply_no.and_then(|r| self.take_send(r)) {
-                RecvOkRaw::Reply { reply_no: seq_no, recv_data, send_data }
-            } else {
-                RecvOkRaw::Payload { reply_no: seq_no, recv_data }
-            });
-        } else {
-            self.recv_window[i] = Some(RecvEntry { seq_no, reply_no, data: recv_data.into() });
-            if is_full {
-                Err(DirectError::WindowIsFull)
-            } else {
-                Err(DirectError::OutOfSequence)
+            if locked {
+                debug_assert!(!self.is_locked);
+                self.is_locked = true;
             }
+            Ok(if let Some(send_data) = reply_no.and_then(|r| self.take_send(r)) {
+                RecvOkRaw::Reply { reply_no: seq_no, recv_data, send_data, locked }
+            } else {
+                RecvOkRaw::Payload { reply_no: seq_no, recv_data, locked }
+            })
         }
     }
     /// If this returns `Ok` then `try_send` might succeed on next call.
-    pub fn pump_raw(&mut self) -> Result<RecvOkRaw<SendData, RecvData>, Error> {
+    pub fn pump_raw(&mut self) -> Result<RecvOkRaw<SendData, RecvData>, PumpError> {
         let next_seq_no = self.pre_recv_seq_no.wrapping_add(1);
         let i = next_seq_no as usize % self.recv_window.len();
 
-        if self.recv_window[i].as_ref().map_or(false, |pre| pre.seq_no == next_seq_no) {
-            if self.is_full_inner(false) {
-                return Err(Error::WindowIsFull);
-            }
+        if let Some(entry) = &self.recv_window[i].as_ref() {
+            if entry.seq_no == next_seq_no {
+                if self.is_full_inner(false) {
+                    return Err(PumpError::WindowIsFull);
+                }
 
-            let entry = self.recv_window[i].take().unwrap();
-            self.pre_recv_seq_no = next_seq_no;
-            self.concurrent_replies[self.concurrent_replies_total] = entry.seq_no;
-            self.concurrent_replies_total += 1;
-            return Ok(if let Some(send_data) = entry.reply_no.and_then(|r| self.take_send(r)) {
-                RecvOkRaw::Reply { reply_no: entry.seq_no, recv_data: entry.data, send_data }
-            } else {
-                RecvOkRaw::Payload { reply_no: entry.seq_no, recv_data: entry.data }
-            });
-        } else {
-            Err(Error::OutOfSequence)
+                if !entry.locked || !self.is_locked {
+                    let entry = self.recv_window[i].take().unwrap();
+                    self.pre_recv_seq_no = next_seq_no;
+                    self.concurrent_replies[self.concurrent_replies_total] = entry.seq_no;
+                    self.concurrent_replies_total += 1;
+                    if entry.locked {
+                        debug_assert!(!self.is_locked);
+                        self.is_locked = true;
+                    }
+                    return Ok(if let Some(send_data) = entry.reply_no.and_then(|r| self.take_send(r)) {
+                        RecvOkRaw::Reply {
+                            reply_no: entry.seq_no,
+                            locked: entry.locked,
+                            recv_data: entry.data,
+                            send_data,
+                        }
+                    } else {
+                        RecvOkRaw::Payload {
+                            reply_no: entry.seq_no,
+                            locked: entry.locked,
+                            recv_data: entry.data,
+                        }
+                    });
+                } else {
+                    return Err(PumpError::WindowIsLocked);
+                }
+            }
         }
+        Err(PumpError::OutOfSequence)
     }
     /// This function must be passed a reply number given by `receive_raw` or `pump_raw`, otherwise
     /// it will do nothing. This reply number can only be used to reply once.
@@ -400,7 +495,7 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
     /// and since each fragment will be received in order it will be trivial for them to reconstruct
     /// the original file.
     #[must_use]
-    pub fn reply_raw_and_direct(&mut self, reply_no: SeqNo, packet_data: SendData, current_time: i64) -> Option<Packet<&SendData>> {
+    pub fn reply_raw_and_direct(&mut self, reply_no: SeqNo, unlock: bool, packet_data: SendData, current_time: i64) -> Option<Packet<&SendData>> {
         if self.remove_reservation(reply_no) {
             let seq_no = self.next_send_seq_no;
             self.next_send_seq_no = self.next_send_seq_no.wrapping_add(1);
@@ -408,6 +503,10 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
             let next_resend_time = current_time + self.resend_interval;
             if self.next_service_timestamp > next_resend_time {
                 self.next_service_timestamp = next_resend_time;
+            }
+            if unlock {
+                debug_assert!(self.is_locked, "The window must be locked to attempt to unlock: double unlock detected.");
+                self.is_locked = false;
             }
             let slot = self.send_window_slot_mut(seq_no);
             debug_assert!(slot.is_none());
@@ -423,8 +522,13 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
             None
         }
     }
-    pub fn ack_raw_and_direct(&mut self, reply_no: SeqNo) -> Option<Packet<&SendData>> {
+    #[must_use]
+    pub fn ack_raw_and_direct(&mut self, reply_no: SeqNo, unlock: bool) -> Option<Packet<&SendData>> {
         if self.remove_reservation(reply_no) {
+            if unlock {
+                debug_assert!(self.is_locked, "The window must be locked to attempt to unlock: double unlock detected.");
+                self.is_locked = false;
+            }
             Some(Packet::Ack(reply_no))
         } else {
             None
