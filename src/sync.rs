@@ -27,7 +27,7 @@ impl<'a, TL: TransportLayer<SendData>, SendData, RecvData, const CAP: usize> Rep
     /// The identifier will tell the remote peer which packets contain fragments of the file,
     /// and since each fragment will be received in order it will be trivial for them to reconstruct
     /// the original file.
-    pub fn reply(self,  packet_data: SendData) {
+    pub fn reply(self, packet_data: SendData) {
         self.reply_inner(false, |_, _| packet_data)
     }
     pub fn reply_locked(self, packet_data: SendData) {
@@ -207,7 +207,12 @@ impl<SendData, RecvData, const CAP: usize> SeqExSync<SendData, RecvData, CAP> {
     pub fn send_locked_with(&self, app: impl TransportLayer<SendData>, packet_data: impl FnMut(SeqNo) -> SendData) {
         self.send_with_inner(app, true, packet_data)
     }
-    pub fn try_send_with<TL: TransportLayer<SendData>>(&self, app: TL, locked: bool, packet_data: impl FnOnce(SeqNo) -> SendData) -> Result<(), SendData> {
+    pub fn try_send_with<TL: TransportLayer<SendData>>(
+        &self,
+        app: TL,
+        locked: bool,
+        packet_data: impl FnOnce(SeqNo) -> SendData,
+    ) -> Result<(), SendData> {
         let mut seq = self.lock();
         let seq_no = seq.seq_no();
         seq.try_send(app, locked, packet_data(seq_no))
