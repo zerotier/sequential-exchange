@@ -1,7 +1,7 @@
 use std::{sync::mpsc::Receiver, thread, time::Duration};
 
 use seq_ex::{
-    sync::{MpscSeqEx, MpscTransport},
+    sync::{MpscTransport, SeqExSync},
     Packet,
 };
 
@@ -19,7 +19,7 @@ fn drop_packet() -> bool {
     rand_core::OsRng.next_u32() & 1 > 0
 }
 
-fn receive(recv: &Receiver<Packet<Payload>>, seq: &MpscSeqEx<Payload>, transport: &MpscTransport<Payload>, value: &mut f32) {
+fn receive(recv: &Receiver<Packet<Payload>>, seq: &SeqExSync<Payload, Payload>, transport: &MpscTransport<Payload>, value: &mut f32) {
     while let Ok(packet) = recv.try_recv() {
         if drop_packet() {
             continue;
@@ -42,20 +42,20 @@ fn receive(recv: &Receiver<Packet<Payload>>, seq: &MpscSeqEx<Payload>, transport
 fn main() {
     let (transport1, recv2) = MpscTransport::new();
     let (transport2, recv1) = MpscTransport::new();
-    let seq1 = MpscSeqEx::new(5, 1);
-    let seq2 = MpscSeqEx::new(5, 1);
+    let seq1 = SeqExSync::new(5, 1);
+    let seq2 = SeqExSync::new(5, 1);
     let mut value = 0.0;
     let mut remote_value = value;
 
-    seq1.send(&transport1, Payload::Add(1.0));
+    seq1.send(&transport1, true, Payload::Add(1.0));
     value += 1.0;
-    seq1.send(&transport1, Payload::Sub(2.0));
+    seq1.send(&transport1, true, Payload::Sub(2.0));
     value -= 2.0;
-    seq1.send(&transport1, Payload::Mul(3.0));
+    seq1.send(&transport1, true, Payload::Mul(3.0));
     value *= 3.0;
-    seq1.send(&transport1, Payload::Div(4.0));
+    seq1.send(&transport1, true, Payload::Div(4.0));
     value /= 4.0;
-    seq1.send(&transport1, Payload::Mod(5.0));
+    seq1.send(&transport1, true, Payload::Mod(5.0));
     value %= 5.0;
 
     for _ in 0..16 {

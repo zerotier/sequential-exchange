@@ -60,7 +60,7 @@ fn process(peer: &Peer, recv_data: RecvOk<'_, &Transport, Payload, Payload, Payl
             let transport = peer.transport.clone();
             let seqex = peer.seqex.clone();
             if let Some(file) = filesystem.read().unwrap().get(&filename) {
-                guard.reply(ConfirmRequestFile { filesize: file.len() as u64 });
+                guard.reply(true, ConfirmRequestFile { filesize: file.len() as u64 });
             }
             thread::spawn(move || {
                 let filesystem = filesystem.read().unwrap();
@@ -70,18 +70,22 @@ fn process(peer: &Peer, recv_data: RecvOk<'_, &Transport, Payload, Payload, Payl
                     let mut i = 0;
                     while i < file.len() {
                         let j = file.len().min(i + FILE_CHUNK_SIZE);
-                        seqex.send_locked(&transport, FileDownload { filename: filename.clone(), file_chunk: file[i..j].to_vec() });
+                        seqex.send(
+                            &transport,
+                            true,
+                            FileDownload { filename: filename.clone(), file_chunk: file[i..j].to_vec() },
+                        );
                         i = j;
                     }
                 }
             });
         }
-        (Some((_, ConfirmRequestFile { filesize })), Some(RequestFile { filename })) => {
+        (Some((_g, ConfirmRequestFile { filesize })), Some(RequestFile { filename })) => {
             let mut filesystem = peer.filesystem.write().unwrap();
             let file = Vec::with_capacity(filesize as usize);
             filesystem.insert(filename, file);
         }
-        (Some((_, FileDownload { filename, file_chunk })), None) => {
+        (Some((_g, FileDownload { filename, file_chunk })), None) => {
             let mut filesystem = peer.filesystem.write().unwrap();
             if let Some(file) = filesystem.get_mut(&filename) {
                 if file.len() + file_chunk.len() <= file.capacity() {
@@ -102,7 +106,7 @@ fn receive(peer: &Peer) {
             continue;
         }
         if let Ok(parsed_packet) = serde_cbor::from_slice::<Packet<Payload>>(&packet) {
-            for recv_data in peer.seqex.receive_all(&peer.transport, parsed_packet) {
+            for recv_data in peer.seqex.try_receive_all(&peer.transport, parsed_packet) {
                 process(peer, recv_data);
             }
         }
@@ -137,14 +141,15 @@ fn main() {
         receiver: recv2,
     };
 
-    peer1.seqex.send(&peer1.transport, Payload::RequestFile { filename: "File1".to_string() });
-    peer1.seqex.send(&peer1.transport, Payload::RequestFile { filename: "File3".to_string() });
-    peer1.seqex.send(&peer1.transport, Payload::RequestFile { filename: "File2".to_string() });
+    let tl = &peer1.transport;
+    peer1.seqex.send(tl, false, Payload::RequestFile { filename: "File1".to_string() });
+    peer1.seqex.send(tl, false, Payload::RequestFile { filename: "File3".to_string() });
+    peer1.seqex.send(tl, false, Payload::RequestFile { filename: "File2".to_string() });
 
-    for _ in 0..500 {
+    for _ in 0..400 {
         receive(&peer1);
         receive(&peer2);
-        thread::sleep(Duration::from_millis(1));
+        thread::sleep(Duration::from_millis(2));
         peer1.seqex.service(&peer1.transport);
         peer2.seqex.service(&peer2.transport);
     }

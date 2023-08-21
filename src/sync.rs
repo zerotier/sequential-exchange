@@ -1,81 +1,69 @@
 use std::{
-    ops::{Deref, DerefMut},
     sync::{
         mpsc::{channel, Receiver, Sender},
-        Condvar, Mutex, MutexGuard,
+        Condvar, Mutex,
     },
     time::Instant,
 };
 
-use crate::{Packet, PumpError, RecvOkRaw, SeqEx, SeqNo, TransportLayer, DEFAULT_INITIAL_SEQ_NO, DEFAULT_RESEND_INTERVAL_MS, DEFAULT_WINDOW_CAP};
+use crate::{
+    Packet, PumpError, RecvError, RecvOkRaw, SeqEx, SeqNo, TransportLayer, DEFAULT_INITIAL_SEQ_NO, DEFAULT_RESEND_INTERVAL_MS, DEFAULT_WINDOW_CAP,
+};
 
 pub struct SeqExSync<SendData, RecvData, const CAP: usize = DEFAULT_WINDOW_CAP> {
-    seq_ex: Mutex<(SeqEx<SendData, RecvData, CAP>, usize)>,
+    seq_ex: Mutex<(SeqEx<SendData, RecvData, CAP>, usize, bool)>,
     send_block: Condvar,
-    recv_lock: Condvar,
+    reply_block: Condvar,
 }
 
 pub struct ReplyGuard<'a, TL: TransportLayer<SendData>, SendData, RecvData, const CAP: usize = DEFAULT_WINDOW_CAP> {
     seq: &'a SeqExSync<SendData, RecvData, CAP>,
     app: Option<TL>,
     reply_no: SeqNo,
-    locked: bool,
+    is_holding_lock: bool,
 }
 impl<'a, TL: TransportLayer<SendData>, SendData, RecvData, const CAP: usize> ReplyGuard<'a, TL, SendData, RecvData, CAP> {
+    fn reply_with(mut self, seq_cst: bool, packet_data: impl FnOnce(SeqNo, SeqNo) -> SendData) {
+        let app = self.app.take().unwrap();
+        let mut seq = self.seq.seq_ex.lock().unwrap();
+        let seq_no = seq.0.seq_no();
+        seq.0
+            .reply_raw(app, self.reply_no, self.is_holding_lock, seq_cst, packet_data(seq_no, self.reply_no));
+        if seq.2 {
+            seq.2 = false;
+            drop(seq);
+            self.seq.reply_block.notify_all();
+        }
+    }
     /// If you need to reply more than once, say to fragment a large file, then include in your
     /// first reply some identifier, and then `send` all fragments with the same included identifier.
     /// The identifier will tell the remote peer which packets contain fragments of the file,
     /// and since each fragment will be received in order it will be trivial for them to reconstruct
     /// the original file.
-    pub fn reply(self, packet_data: SendData) {
-        self.reply_inner(false, |_, _| packet_data)
-    }
-    pub fn reply_locked(self, packet_data: SendData) {
-        self.reply_inner(true, |_, _| packet_data)
-    }
-    pub fn reply_with(self, packet_data: impl FnOnce(SeqNo, SeqNo) -> SendData) {
-        self.reply_inner(false, packet_data)
-    }
-    pub fn reply_locked_with(self, packet_data: impl FnOnce(SeqNo, SeqNo) -> SendData) {
-        self.reply_inner(true, packet_data)
-    }
-    fn reply_inner(mut self, locked: bool, packet_data: impl FnOnce(SeqNo, SeqNo) -> SendData) {
-        let mut app = None;
-        core::mem::swap(&mut app, &mut self.app);
-        let mut seq = self.seq.lock();
-        let seq_no = seq.seq_no();
-        seq.reply_raw(app.unwrap(), self.reply_no, self.locked, locked, packet_data(seq_no, self.reply_no));
-        drop(seq);
-        if self.locked {
-            self.seq.recv_lock.notify_all();
-        }
-        core::mem::forget(self);
+    pub fn reply(self, seq_cst: bool, packet_data: SendData) {
+        self.reply_with(seq_cst, |_, _| packet_data)
     }
 }
 impl<'a, TL: TransportLayer<SendData>, SendData, RecvData, const CAP: usize> Drop for ReplyGuard<'a, TL, SendData, RecvData, CAP> {
     fn drop(&mut self) {
-        if let Some(app) = self.app.as_mut() {
-            let mut seq = self.seq.lock();
-            if let Some(p) = seq.ack_raw_and_direct(self.reply_no, self.locked) {
-                app.send(p)
+        if let Some(app) = self.app.take() {
+            let mut seq = self.seq.seq_ex.lock().unwrap();
+            seq.0.ack_raw(app, self.reply_no, self.is_holding_lock);
+            if seq.2 {
+                seq.2 = false;
+                drop(seq);
+                self.seq.reply_block.notify_all();
             }
         }
     }
 }
 impl<'a, TL: TransportLayer<SendData>, SendData, RecvData, const CAP: usize> std::fmt::Debug for ReplyGuard<'a, TL, SendData, RecvData, CAP> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ReplyGuard").field("reply_no", &self.reply_no).finish()
+        f.debug_struct("ReplyGuard")
+            .field("reply_no", &self.reply_no)
+            .field("is_holding_lock", &self.is_holding_lock)
+            .finish()
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Error {
-    /// The packet is out-of-sequence. It was either received too soon or too late and so it would be
-    /// invalid to process it right now. No action needs to be taken by the caller.
-    OutOfSequence,
-    /// The Send Window is currently full. The received packet cannot be processed right now because
-    /// it could cause the send window to overflow. No action needs to be taken by the caller.
-    WindowIsFull,
 }
 
 pub enum RecvOk<'a, TL: TransportLayer<SendData>, P, SendData, RecvData, const CAP: usize = DEFAULT_WINDOW_CAP> {
@@ -94,135 +82,138 @@ pub enum RecvOk<'a, TL: TransportLayer<SendData>, P, SendData, RecvData, const C
 }
 crate::impl_recvok!(RecvOk, &'a SeqExSync<SendData, RecvData, CAP>);
 
-pub struct ReplyIter<'a, TL: TransportLayer<SendData>, P: Into<RecvData>, SendData, RecvData, const CAP: usize = DEFAULT_WINDOW_CAP> {
+pub struct RecvIter<'a, TL: TransportLayer<SendData>, P, SendData, RecvData, const CAP: usize = DEFAULT_WINDOW_CAP> {
     seq: Option<&'a SeqExSync<SendData, RecvData, CAP>>,
     app: TL,
     first: Option<RecvOk<'a, TL, P, SendData, RecvData, CAP>>,
-}
-
-pub struct SeqExGuard<'a, SendData, RecvData, const CAP: usize>(MutexGuard<'a, (SeqEx<SendData, RecvData, CAP>, usize)>);
-impl<'a, SendData, RecvData, const CAP: usize> Deref for SeqExGuard<'a, SendData, RecvData, CAP> {
-    type Target = SeqEx<SendData, RecvData, CAP>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0 .0
-    }
-}
-impl<'a, SendData, RecvData, const CAP: usize> DerefMut for SeqExGuard<'a, SendData, RecvData, CAP> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0 .0
-    }
+    blocking: bool,
 }
 
 impl<SendData, RecvData, const CAP: usize> SeqExSync<SendData, RecvData, CAP> {
     pub fn new(retry_interval: i64, initial_seq_no: SeqNo) -> Self {
         Self {
-            seq_ex: Mutex::new((SeqEx::new(retry_interval, initial_seq_no), 0)),
+            seq_ex: Mutex::new((SeqEx::new(retry_interval, initial_seq_no), 0, false)),
             send_block: Condvar::default(),
-            recv_lock: Condvar::default(),
+            reply_block: Condvar::default(),
         }
     }
 
     pub fn receive<TL: TransportLayer<SendData>, P: Into<RecvData>>(
         &self,
         app: TL,
-        mut packet: Packet<P>,
-    ) -> Result<RecvOk<'_, TL, P, SendData, RecvData, CAP>, Error> {
+        packet: Packet<P>,
+    ) -> Result<RecvOk<'_, TL, P, SendData, RecvData, CAP>, RecvError> {
         let mut seq = self.seq_ex.lock().unwrap();
+        match seq.0.receive_raw(app.clone(), packet) {
+            Ok(r) => {
+                if seq.1 > 0 {
+                    seq.1 -= 1;
+                    drop(seq);
+                    self.send_block.notify_one();
+                }
+                Ok(RecvOk::from_raw(self, app, r))
+            }
+            Err(e) => Err(e),
+        }
+    }
+    pub fn try_pump<TL: TransportLayer<SendData>>(&self, app: TL) -> Result<RecvOk<'_, TL, RecvData, SendData, RecvData, CAP>, PumpError> {
+        let mut seq = self.seq_ex.lock().unwrap();
+        // Enforce that only one thread may pump at a time.
+        if seq.2 {
+            return Err(PumpError::WaitingForReply);
+        }
+        match seq.0.try_pump_raw() {
+            Ok(r) => {
+                if seq.1 > 0 {
+                    seq.1 -= 1;
+                    drop(seq);
+                    self.send_block.notify_one();
+                }
+                Ok(RecvOk::from_raw(self, app, r))
+            }
+            Err(e) => Err(e),
+        }
+    }
+    pub fn pump<TL: TransportLayer<SendData>>(&self, app: TL) -> Option<RecvOk<'_, TL, RecvData, SendData, RecvData, CAP>> {
+        let mut seq = self.seq_ex.lock().unwrap();
+        // Enforce that only one thread may pump at a time.
+        if seq.2 {
+            return None;
+        }
         loop {
-            match seq.0.receive_raw(app.clone(), packet) {
+            match seq.0.try_pump_raw() {
                 Ok(r) => {
                     if seq.1 > 0 {
+                        seq.1 -= 1;
+                        drop(seq);
                         self.send_block.notify_one();
                     }
-                    return Ok(RecvOk::from_raw(self, app, r));
+                    return Some(RecvOk::from_raw(self, app, r));
                 }
-                Err(crate::Error::OutOfSequence) => return Err(Error::OutOfSequence),
-                Err(crate::Error::WindowIsFull(_)) => return Err(Error::WindowIsFull),
-                Err(crate::Error::WindowIsLocked(p)) => {
-                    seq = self.recv_lock.wait(seq).unwrap();
-                    packet = p;
+                Err(PumpError::WaitingForRecv) => return None,
+                Err(PumpError::WaitingForReply) => {
+                    seq.2 = true;
+                    seq = self.reply_block.wait(seq).unwrap();
                 }
             }
         }
     }
-    pub fn pump<TL: TransportLayer<SendData>>(&self, app: TL) -> Result<RecvOk<'_, TL, RecvData, SendData, RecvData, CAP>, Error> {
-        let mut seq = self.seq_ex.lock().unwrap();
-        loop {
-            match seq.0.pump_raw() {
-                Ok(r) => {
-                    if seq.1 > 0 {
-                        self.send_block.notify_one();
-                    }
-                    return Ok(RecvOk::from_raw(self, app, r));
-                }
-                Err(PumpError::OutOfSequence) => return Err(Error::OutOfSequence),
-                Err(PumpError::WindowIsFull) => return Err(Error::WindowIsFull),
-                Err(PumpError::WindowIsLocked) => {
-                    seq = self.recv_lock.wait(seq).unwrap();
-                }
-            }
+
+    fn receive_all_inner<TL: TransportLayer<SendData>, P: Into<RecvData>>(
+        &self,
+        app: TL,
+        blocking: bool,
+        packet: Packet<P>,
+    ) -> RecvIter<'_, TL, P, SendData, RecvData, CAP> {
+        match self.receive(app.clone(), packet) {
+            Ok(r) => RecvIter { seq: Some(self), app, first: Some(r), blocking },
+            Err(RecvError::WaitingForReply) if blocking => RecvIter { seq: Some(self), app, first: None, blocking },
+            Err(_) => RecvIter { seq: None, app, first: None, blocking },
         }
     }
     pub fn receive_all<TL: TransportLayer<SendData>, P: Into<RecvData>>(
         &self,
         app: TL,
         packet: Packet<P>,
-    ) -> ReplyIter<'_, TL, P, SendData, RecvData, CAP> {
-        if let Ok(r) = self.receive(app.clone(), packet) {
-            ReplyIter { seq: Some(self), app, first: Some(r) }
-        } else {
-            ReplyIter { seq: None, app, first: None }
-        }
+    ) -> RecvIter<'_, TL, P, SendData, RecvData, CAP> {
+        self.receive_all_inner(app, true, packet)
     }
-    pub fn try_send<TL: TransportLayer<SendData>>(&self, app: TL, locked: bool, packet_data: SendData) -> Result<(), SendData> {
-        self.try_send_with(app, locked, |_| packet_data)
+    pub fn try_receive_all<TL: TransportLayer<SendData>, P: Into<RecvData>>(
+        &self,
+        app: TL,
+        packet: Packet<P>,
+    ) -> RecvIter<'_, TL, P, SendData, RecvData, CAP> {
+        self.receive_all_inner(app, false, packet)
     }
-    fn send_with_inner<TL: TransportLayer<SendData>>(&self, app: TL, locked: bool, mut packet_data: impl FnMut(SeqNo) -> SendData) {
+
+    pub fn try_send_with<TL: TransportLayer<SendData>, F: FnOnce(SeqNo) -> SendData>(&self, app: TL, seq_cst: bool, packet_data: F) -> Result<(), F> {
         let mut seq = self.seq_ex.lock().unwrap();
-        while let Err(()) = seq.0.try_send_with(app.clone(), locked, &mut packet_data) {
-            seq.1 += 1;
-            seq = self.send_block.wait(seq).unwrap();
-            seq.1 -= 1;
-        }
+        seq.0.try_send_with(app, seq_cst, packet_data)
     }
-    fn send_inner<TL: TransportLayer<SendData>>(&self, app: TL, locked: bool, mut packet_data: SendData) {
+    pub fn try_send<TL: TransportLayer<SendData>>(&self, app: TL, seq_cst: bool, packet_data: SendData) -> Result<(), SendData> {
         let mut seq = self.seq_ex.lock().unwrap();
-        while let Err(p) = seq.0.try_send(app.clone(), locked, packet_data) {
+        seq.0.try_send(app, seq_cst, packet_data)
+    }
+
+    pub fn send_with<TL: TransportLayer<SendData>>(&self, app: TL, seq_cst: bool, mut packet_data: impl FnOnce(SeqNo) -> SendData) {
+        let mut seq = self.seq_ex.lock().unwrap();
+        while let Err(p) = seq.0.try_send_with(app.clone(), seq_cst, packet_data) {
             packet_data = p;
             seq.1 += 1;
             seq = self.send_block.wait(seq).unwrap();
-            seq.1 -= 1;
         }
     }
-    pub fn send(&self, app: impl TransportLayer<SendData>, packet_data: SendData) {
-        self.send_inner(app, false, packet_data)
-    }
-    pub fn send_locked(&self, app: impl TransportLayer<SendData>, packet_data: SendData) {
-        self.send_inner(app, true, packet_data)
-    }
-    pub fn send_with(&self, app: impl TransportLayer<SendData>, packet_data: impl FnMut(SeqNo) -> SendData) {
-        self.send_with_inner(app, false, packet_data)
-    }
-    pub fn send_locked_with(&self, app: impl TransportLayer<SendData>, packet_data: impl FnMut(SeqNo) -> SendData) {
-        self.send_with_inner(app, true, packet_data)
-    }
-    pub fn try_send_with<TL: TransportLayer<SendData>>(
-        &self,
-        app: TL,
-        locked: bool,
-        packet_data: impl FnOnce(SeqNo) -> SendData,
-    ) -> Result<(), SendData> {
-        let mut seq = self.lock();
-        let seq_no = seq.seq_no();
-        seq.try_send(app, locked, packet_data(seq_no))
-    }
-    pub fn service<TL: TransportLayer<SendData>>(&self, app: TL) -> i64 {
-        self.lock().service(app)
+    pub fn send<TL: TransportLayer<SendData>>(&self, app: TL, seq_cst: bool, mut packet_data: SendData) {
+        let mut seq = self.seq_ex.lock().unwrap();
+        while let Err(p) = seq.0.try_send(app.clone(), seq_cst, packet_data) {
+            packet_data = p;
+            seq.1 += 1;
+            seq = self.send_block.wait(seq).unwrap();
+        }
     }
 
-    pub fn lock(&self) -> SeqExGuard<'_, SendData, RecvData, CAP> {
-        SeqExGuard(self.seq_ex.lock().unwrap())
+    pub fn service<TL: TransportLayer<SendData>>(&self, app: TL) -> i64 {
+        self.seq_ex.lock().unwrap().0.service(app)
     }
 }
 impl<SendData, RecvData, const CAP: usize> Default for SeqExSync<SendData, RecvData, CAP> {
@@ -231,20 +222,24 @@ impl<SendData, RecvData, const CAP: usize> Default for SeqExSync<SendData, RecvD
     }
 }
 
-impl<'a, TL: TransportLayer<SendData>, P: Into<RecvData>, SendData, RecvData, const CAP: usize> ReplyIter<'a, TL, P, SendData, RecvData, CAP> {
+impl<'a, TL: TransportLayer<SendData>, P, SendData, RecvData, const CAP: usize> RecvIter<'a, TL, P, SendData, RecvData, CAP> {
     pub fn take_first(&mut self) -> Option<RecvOk<'a, TL, P, SendData, RecvData, CAP>> {
         self.first.take()
     }
 }
 impl<'a, TL: TransportLayer<SendData>, P: Into<RecvData>, SendData, RecvData, const CAP: usize> Iterator
-    for ReplyIter<'a, TL, P, SendData, RecvData, CAP>
+    for RecvIter<'a, TL, P, SendData, RecvData, CAP>
 {
     type Item = RecvOk<'a, TL, RecvData, SendData, RecvData, CAP>;
     fn next(&mut self) -> Option<Self::Item> {
         if let Some(g) = self.first.take() {
             Some(g.into())
         } else if let Some(origin) = self.seq {
-            origin.pump(self.app.clone()).ok()
+            if self.blocking {
+                origin.pump(self.app.clone())
+            } else {
+                origin.try_pump(self.app.clone()).ok()
+            }
         } else {
             None
         }
@@ -256,8 +251,6 @@ pub struct MpscTransport<Payload: Clone> {
     pub channel: Sender<Packet<Payload>>,
     pub time: Instant,
 }
-pub type MpscGuard<'a, Packet> = ReplyGuard<'a, &'a MpscTransport<Packet>, Packet, Packet>;
-pub type MpscSeqEx<Packet> = SeqExSync<Packet, Packet>;
 
 impl<Payload: Clone> MpscTransport<Payload> {
     pub fn new() -> (Self, Receiver<Packet<Payload>>) {
