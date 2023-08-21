@@ -43,6 +43,13 @@ impl<'a, TL: TransportLayer<SendData>, SendData, RecvData, const CAP: usize> Rep
     pub fn reply(self, seq_cst: bool, packet_data: SendData) {
         self.reply_with(seq_cst, |_, _| packet_data)
     }
+
+    pub fn to_components(mut self) -> (TL, SeqNo, bool) {
+        (self.app.take().unwrap(), self.reply_no, self.is_holding_lock)
+    }
+    pub unsafe fn from_components(seq: &'a SeqExSync<SendData, RecvData, CAP>, app: TL, reply_no: SeqNo, is_holding_lock: bool) -> Self {
+        ReplyGuard { seq, app: Some(app), reply_no, is_holding_lock }
+    }
 }
 impl<'a, TL: TransportLayer<SendData>, SendData, RecvData, const CAP: usize> Drop for ReplyGuard<'a, TL, SendData, RecvData, CAP> {
     fn drop(&mut self) {

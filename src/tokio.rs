@@ -22,8 +22,8 @@ pub struct ReplyGuard<'a, TL: TokioLayer<Payload = Payload>, Payload, const CAP:
     is_holding_lock: bool,
 }
 impl<'a, TL: TokioLayer<Payload = Payload>, Payload, const CAP: usize> ReplyGuard<'a, TL, Payload, CAP> {
-    fn new(seq: &'a SeqExTokio<Payload, CAP>, app: TL, reply_no: SeqNo, seq_cst: bool) -> Self {
-        ReplyGuard { seq, app: Some(app), reply_no, is_holding_lock: seq_cst }
+    fn new(seq: &'a SeqExTokio<Payload, CAP>, app: TL, reply_no: SeqNo, is_holding_lock: bool) -> Self {
+        ReplyGuard { seq, app: Some(app), reply_no, is_holding_lock }
     }
     fn try_reply_with_inner(&mut self, app: TL, seq_cst: bool, packet_data: impl FnOnce(SeqNo, SeqNo) -> SendData<Payload>) -> Option<i64> {
         let mut seq = self.seq.seq_ex.lock().unwrap();
@@ -63,6 +63,13 @@ impl<'a, TL: TokioLayer<Payload = Payload>, Payload, const CAP: usize> ReplyGuar
         }
         let (reply_no, seq_cst, recv_data) = rx.await.map_err(|_| AsyncError::SeqExClosed)?.ok_or(AsyncError::ReceivedAck)?;
         Ok((Self::new(self.seq, app, reply_no, seq_cst), recv_data))
+    }
+
+    pub fn to_components(mut self) -> (TL, SeqNo, bool) {
+        (self.app.take().unwrap(), self.reply_no, self.is_holding_lock)
+    }
+    pub unsafe fn from_components(seq: &'a SeqExTokio<Payload, CAP>, app: TL, reply_no: SeqNo, is_holding_lock: bool) -> Self {
+        Self::new(seq, app, reply_no, is_holding_lock)
     }
 }
 impl<'a, TL: TokioLayer<Payload = Payload>, Payload, const CAP: usize> Drop for ReplyGuard<'a, TL, Payload, CAP> {
