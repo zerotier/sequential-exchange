@@ -1,5 +1,5 @@
 [package]
-name = "seq_ex"
+name = "seq-ex"
 version = "0.1.0"
 authors = ["Monica Moniot"]
 edition = "2021"
