@@ -4,7 +4,7 @@ use tokio::{
     time,
 };
 
-use crate::{Packet, PumpError, RecvOkRaw, SeqEx, SeqNo, TransportLayer, DEFAULT_INITIAL_SEQ_NO, DEFAULT_RESEND_INTERVAL_MS, DEFAULT_WINDOW_CAP};
+use crate::{Packet, TryError, RecvOkRaw, SeqEx, SeqNo, TransportLayer, DEFAULT_INITIAL_SEQ_NO, DEFAULT_RESEND_INTERVAL_MS, DEFAULT_WINDOW_CAP};
 
 type SendData<Payload> = (oneshot::Sender<Option<(SeqNo, bool, Payload)>>, Payload);
 
@@ -211,7 +211,7 @@ impl<Payload, const CAP: usize> SeqExTokio<Payload, CAP> {
         &self,
         app: TL,
         blocking: bool,
-    ) -> Result<(ReplyGuard<'_, TL, Payload, CAP>, Payload), PumpError> {
+    ) -> Result<(ReplyGuard<'_, TL, Payload, CAP>, Payload), TryError> {
         let mut seq = self.seq_ex.lock().unwrap();
         // Enforce that only one thread may pump at a time.
         loop {
@@ -225,23 +225,23 @@ impl<Payload, const CAP: usize> SeqExTokio<Payload, CAP> {
                         return Ok(ret);
                     }
                 }
-                Err(PumpError::WaitingForRecv) => return Err(PumpError::WaitingForRecv),
-                Err(PumpError::WaitingForReply) => {
+                Err(TryError::WaitingForRecv) => return Err(TryError::WaitingForRecv),
+                Err(TryError::WaitingForReply) => {
                     seq.2 |= blocking;
-                    return Err(PumpError::WaitingForReply);
+                    return Err(TryError::WaitingForReply);
                 }
             }
         }
     }
-    pub fn try_pump<TL: TokioLayer<Payload = Payload>>(&self, app: TL) -> Result<(ReplyGuard<'_, TL, Payload, CAP>, Payload), PumpError> {
+    pub fn try_pump<TL: TokioLayer<Payload = Payload>>(&self, app: TL) -> Result<(ReplyGuard<'_, TL, Payload, CAP>, Payload), TryError> {
         self.try_pump_inner(app, false)
     }
     pub async fn pump<TL: TokioLayer<Payload = Payload>>(&self, app: TL) -> Option<(ReplyGuard<'_, TL, Payload, CAP>, Payload)> {
         loop {
             match self.try_pump_inner(app.clone(), true) {
                 Ok(ret) => return Some(ret),
-                Err(PumpError::WaitingForRecv) => return None,
-                Err(PumpError::WaitingForReply) => {
+                Err(TryError::WaitingForRecv) => return None,
+                Err(TryError::WaitingForReply) => {
                     self.reply_block.notified().await;
                 }
             }

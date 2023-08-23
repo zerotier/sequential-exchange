@@ -13,5 +13,5 @@ pub use single_thread::*;
 #[cfg(feature = "std")]
 pub mod sync;
 
-#[cfg(feature = "tokio")]
-pub mod tokio;
+//#[cfg(feature = "tokio")]
+//pub mod tokio;

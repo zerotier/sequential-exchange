@@ -52,7 +52,7 @@ fn drop_packet() -> bool {
     OsRng.next_u32() >= (u32::MAX / 4 * 3)
 }
 
-fn process(peer: &Peer, recv_data: RecvOk<'_, &Transport, Payload, Payload, Payload>) {
+fn process(peer: &Peer, recv_data: RecvOk<'_, &Transport, Payload, Payload>) {
     use Payload::*;
     match recv_data.consume() {
         (Some((guard, RequestFile { filename })), None) => {

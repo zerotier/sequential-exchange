@@ -1,4 +1,4 @@
-use crate::{DirectRecvError, Packet, PumpError, RecvOkRaw, SeqEx, SeqNo, TransportLayer, DEFAULT_WINDOW_CAP};
+use crate::{TryRecvError, Packet, TryError, RecvOkRaw, SeqEx, SeqNo, TransportLayer, DEFAULT_WINDOW_CAP};
 
 pub struct ReplyGuard<'a, TL: TransportLayer<SendData>, SendData, RecvData, const CAP: usize = DEFAULT_WINDOW_CAP> {
     seq: &'a mut SeqEx<SendData, RecvData, CAP>,
@@ -73,14 +73,14 @@ impl std::fmt::Display for RecvError {
 #[cfg(feature = "std")]
 impl std::error::Error for RecvError {}
 
-pub enum RecvOk<'a, TL: TransportLayer<SendData>, P, SendData, RecvData, const CAP: usize = DEFAULT_WINDOW_CAP> {
+pub enum RecvOk<'a, TL: TransportLayer<SendData>, SendData, RecvData, const CAP: usize = DEFAULT_WINDOW_CAP> {
     Payload {
         reply_guard: ReplyGuard<'a, TL, SendData, RecvData, CAP>,
-        recv_data: P,
+        recv_data: RecvData,
     },
     Reply {
         reply_guard: ReplyGuard<'a, TL, SendData, RecvData, CAP>,
-        recv_data: P,
+        recv_data: RecvData,
         send_data: SendData,
     },
     Ack {
@@ -90,8 +90,8 @@ pub enum RecvOk<'a, TL: TransportLayer<SendData>, P, SendData, RecvData, const C
 macro_rules! impl_recvok {
     ($recv:tt, $seq_ex:ty) => {
         #[cfg(feature = "std")]
-        impl<'a, TL: TransportLayer<SendData>, P: std::fmt::Debug, SendData: std::fmt::Debug, RecvData, const CAP: usize> std::fmt::Debug
-            for $recv<'a, TL, P, SendData, RecvData, CAP>
+        impl<'a, TL: TransportLayer<SendData>, SendData: std::fmt::Debug, RecvData: std::fmt::Debug, const CAP: usize> std::fmt::Debug
+            for $recv<'a, TL, SendData, RecvData, CAP>
         {
             fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 match self {
@@ -110,8 +110,8 @@ macro_rules! impl_recvok {
                 }
             }
         }
-        impl<'a, TL: TransportLayer<SendData>, P, SendData, RecvData, const CAP: usize> $recv<'a, TL, P, SendData, RecvData, CAP> {
-            fn from_raw(seq: $seq_ex, app: TL, value: RecvOkRaw<SendData, P>) -> Self {
+        impl<'a, TL: TransportLayer<SendData>, SendData, RecvData, const CAP: usize> $recv<'a, TL, SendData, RecvData, CAP> {
+            fn from_raw(seq: $seq_ex, app: TL, value: RecvOkRaw<SendData, RecvData>) -> Self {
                 match value {
                     RecvOkRaw::Payload { reply_no, seq_cst, recv_data } => Self::Payload {
                         reply_guard: ReplyGuard { seq, app: Some(app), reply_no, is_holding_lock: seq_cst },
@@ -125,28 +125,19 @@ macro_rules! impl_recvok {
                     RecvOkRaw::Ack { send_data } => Self::Ack { send_data },
                 }
             }
-            pub fn consume(self) -> (Option<(ReplyGuard<'a, TL, SendData, RecvData, CAP>, P)>, Option<SendData>) {
+            pub fn consume(self) -> (Option<(ReplyGuard<'a, TL, SendData, RecvData, CAP>, RecvData)>, Option<SendData>) {
                 match self {
                     Self::Payload { reply_guard, recv_data } => (Some((reply_guard, recv_data)), None),
                     Self::Reply { reply_guard, recv_data, send_data } => (Some((reply_guard, recv_data)), Some(send_data)),
                     Self::Ack { send_data } => (None, Some(send_data)),
                 }
             }
-            pub fn new(recv_data: Option<(ReplyGuard<'a, TL, SendData, RecvData, CAP>, P)>, send_data: Option<SendData>) -> Option<Self> {
+            pub fn new(recv_data: Option<(ReplyGuard<'a, TL, SendData, RecvData, CAP>, RecvData)>, send_data: Option<SendData>) -> Option<Self> {
                 match (recv_data, send_data) {
                     (Some((reply_guard, recv_data)), None) => Some(Self::Payload { reply_guard, recv_data }),
                     (Some((reply_guard, recv_data)), Some(send_data)) => Some(Self::Reply { reply_guard, recv_data, send_data }),
                     (None, Some(send_data)) => Some(Self::Ack { send_data }),
                     (None, None) => None,
-                }
-            }
-        }
-        impl<'a, TL: TransportLayer<SendData>, P: Into<RecvData>, SendData, RecvData, const CAP: usize> $recv<'a, TL, P, SendData, RecvData, CAP> {
-            pub fn into(self) -> $recv<'a, TL, RecvData, SendData, RecvData, CAP> {
-                match self {
-                    Self::Payload { reply_guard, recv_data } => $recv::Payload { reply_guard, recv_data: recv_data.into() },
-                    Self::Reply { reply_guard, recv_data, send_data } => $recv::Reply { reply_guard, recv_data: recv_data.into(), send_data },
-                    Self::Ack { send_data } => $recv::Ack { send_data },
                 }
             }
         }
@@ -157,7 +148,7 @@ pub(crate) use impl_recvok;
 
 impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
     /// Can mutate `next_service_timestamp`.
-    pub fn try_send(&mut self, mut app: impl TransportLayer<SendData>, seq_cst: bool, packet_data: SendData) -> Result<(), SendData> {
+    pub fn try_send(&mut self, mut app: impl TransportLayer<SendData>, seq_cst: bool, packet_data: SendData) -> Result<(), (TryError, SendData)> {
         match self.try_send_direct(app.time(), seq_cst, packet_data) {
             Ok(p) => {
                 app.send(p);
@@ -172,7 +163,7 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
         mut app: impl TransportLayer<SendData>,
         seq_cst: bool,
         packet_data: F,
-    ) -> Result<(), F> {
+    ) -> Result<(), (TryError, F)> {
         match self.try_send_direct_with(app.time(), seq_cst, packet_data) {
             Ok(p) => {
                 app.send(p);
@@ -186,17 +177,17 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
         &mut self,
         mut app: impl TransportLayer<SendData>,
         packet: Packet<P>,
-    ) -> Result<RecvOkRaw<SendData, P>, RecvError> {
+    ) -> Result<(RecvOkRaw<SendData, P>, bool), RecvError> {
         match self.receive_raw_and_direct(packet) {
             Ok(a) => Ok(a),
-            Err(DirectRecvError::DroppedDuplicateResendAck(reply_no)) => {
+            Err(TryRecvError::DroppedDuplicateResendAck(reply_no)) => {
                 app.send(Packet::Ack(reply_no));
                 Err(RecvError::DroppedDuplicate)
             }
-            Err(DirectRecvError::DroppedTooEarly) => Err(RecvError::DroppedTooEarly),
-            Err(DirectRecvError::DroppedDuplicate) => Err(RecvError::DroppedDuplicate),
-            Err(DirectRecvError::WaitingForRecv) => Err(RecvError::WaitingForRecv),
-            Err(DirectRecvError::WaitingForReply) => Err(RecvError::WaitingForReply),
+            Err(TryRecvError::DroppedTooEarly) => Err(RecvError::DroppedTooEarly),
+            Err(TryRecvError::DroppedDuplicate) => Err(RecvError::DroppedDuplicate),
+            Err(TryRecvError::WaitingForRecv) => Err(RecvError::WaitingForRecv),
+            Err(TryRecvError::WaitingForReply) => Err(RecvError::WaitingForReply),
         }
     }
     /// Can mutate `next_service_timestamp`.
@@ -229,14 +220,14 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
         }
         self.resend_interval.min(self.next_service_timestamp - current_time)
     }
-    pub fn receive<TL: TransportLayer<SendData>, P: Into<RecvData>>(
+    pub fn receive<TL: TransportLayer<SendData>>(
         &mut self,
         app: TL,
-        packet: Packet<P>,
-    ) -> Result<RecvOk<'_, TL, P, SendData, RecvData, CAP>, RecvError> {
-        self.receive_raw(app.clone(), packet).map(|r| RecvOk::from_raw(self, app, r))
+        packet: Packet<RecvData>,
+    ) -> Result<(RecvOk<'_, TL, SendData, RecvData, CAP>, bool), RecvError> {
+        self.receive_raw(app.clone(), packet).map(|(r, do_pump)| (RecvOk::from_raw(self, app, r), do_pump))
     }
-    pub fn try_pump<TL: TransportLayer<SendData>>(&mut self, app: TL) -> Result<RecvOk<'_, TL, RecvData, SendData, RecvData, CAP>, PumpError> {
-        self.try_pump_raw().map(|r| RecvOk::from_raw(self, app, r))
+    pub fn try_pump<TL: TransportLayer<SendData>>(&mut self, app: TL) -> Result<(RecvOk<'_, TL, SendData, RecvData, CAP>, bool), TryError> {
+        self.try_pump_raw().map(|(r, do_pump)| (RecvOk::from_raw(self, app, r), do_pump))
     }
 }

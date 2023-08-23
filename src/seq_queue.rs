@@ -93,7 +93,7 @@ struct SendEntry<SendData> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DirectRecvError {
+pub enum TryRecvError {
     DroppedTooEarly,
     DroppedDuplicate,
     DroppedDuplicateResendAck(SeqNo),
@@ -101,36 +101,36 @@ pub enum DirectRecvError {
     WaitingForReply,
 }
 #[cfg(feature = "std")]
-impl std::fmt::Display for DirectRecvError {
+impl std::fmt::Display for TryRecvError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            DirectRecvError::DroppedTooEarly => write!(f, "packet arrived too early"),
-            DirectRecvError::DroppedDuplicate => write!(f, "packet was a duplicate"),
-            DirectRecvError::DroppedDuplicateResendAck(_) => write!(f, "packet was a duplicate, resending ack"),
-            DirectRecvError::WaitingForRecv => write!(f, "can't process until another packet is received"),
-            DirectRecvError::WaitingForReply => write!(f, "can't process until a reply is finished"),
+            TryRecvError::DroppedTooEarly => write!(f, "packet arrived too early"),
+            TryRecvError::DroppedDuplicate => write!(f, "packet was a duplicate"),
+            TryRecvError::DroppedDuplicateResendAck(_) => write!(f, "packet was a duplicate, resending ack"),
+            TryRecvError::WaitingForRecv => write!(f, "can't process until another packet is received"),
+            TryRecvError::WaitingForReply => write!(f, "can't process until a reply is finished"),
         }
     }
 }
 #[cfg(feature = "std")]
-impl std::error::Error for DirectRecvError {}
+impl std::error::Error for TryRecvError {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PumpError {
+pub enum TryError {
     WaitingForRecv,
     WaitingForReply,
 }
 #[cfg(feature = "std")]
-impl std::fmt::Display for PumpError {
+impl std::fmt::Display for TryError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            PumpError::WaitingForRecv => write!(f, "can't process until another packet is received"),
-            PumpError::WaitingForReply => write!(f, "can't process until a reply is finished"),
+            TryError::WaitingForRecv => write!(f, "can't process until another packet is received"),
+            TryError::WaitingForReply => write!(f, "can't process until a reply is finished"),
         }
     }
 }
 #[cfg(feature = "std")]
-impl std::error::Error for PumpError {}
+impl std::error::Error for TryError {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -282,18 +282,18 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
         &mut self.send_window[seq_no as usize % self.send_window.len()]
     }
     #[inline]
-    fn is_full_inner(&self, is_for_send: bool, reply_no: Option<SeqNo>) -> Result<(), PumpError> {
+    fn is_full_inner(&self, reply_no: Option<SeqNo>) -> Result<(), TryError> {
         if self.concurrent_replies_total >= self.concurrent_replies.len() - 2 {
-            return Err(PumpError::WaitingForReply);
+            return Err(TryError::WaitingForReply);
         }
         let reply_idx = reply_no.map_or(self.send_window.len(), |r| r as usize % self.send_window.len());
-        for i in 0..1 + is_for_send as u32 + self.concurrent_replies_total as u32 {
+        for i in 0..1 + self.concurrent_replies_total as u32 {
             let idx = self.next_send_seq_no.wrapping_add(i) as usize % self.send_window.len();
             if self.send_window[idx].is_some() && reply_idx != idx {
-                return if i < 1 + is_for_send as u32 {
-                    Err(PumpError::WaitingForRecv)
+                return if i == 0 {
+                    Err(TryError::WaitingForRecv)
                 } else {
-                    Err(PumpError::WaitingForReply)
+                    Err(TryError::WaitingForReply)
                 }
             }
         }
@@ -348,7 +348,7 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
     /// `retry_interval`. `current_time` does not have to be monotonically increasing.
     ///
     /// Can mutate `next_service_timestamp`.
-    pub fn try_send_direct(&mut self, current_time: i64, seq_cst: bool, packet_data: SendData) -> Result<Packet<&SendData>, (PumpError, SendData)> {
+    pub fn try_send_direct(&mut self, current_time: i64, seq_cst: bool, packet_data: SendData) -> Result<Packet<&SendData>, (TryError, SendData)> {
         let mut tmp = Some(packet_data);
         self.try_send_direct_with(current_time, seq_cst, |_| tmp.take().unwrap())
             .map_err(|e| e.0)
@@ -360,8 +360,8 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
         current_time: i64,
         seq_cst: bool,
         packet_data: F,
-    ) -> Result<Packet<&SendData>, (PumpError, F)> {
-        if let Err(e) = self.is_full_inner(true, None) {
+    ) -> Result<Packet<&SendData>, (TryError, F)> {
+        if let Err(e) = self.is_full_inner(None) {
             return Err((e, packet_data));
         }
 
@@ -404,7 +404,7 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
     }
 
     /// If this returns `Ok` then `try_send` might succeed on next call.
-    pub fn receive_raw_and_direct<P: Into<RecvData>>(&mut self, packet: Packet<P>) -> Result<(RecvOkRaw<SendData, P>, bool), DirectRecvError> {
+    pub fn receive_raw_and_direct<P: Into<RecvData>>(&mut self, packet: Packet<P>) -> Result<(RecvOkRaw<SendData, P>, bool), TryRecvError> {
         let seq_cst = packet.is_seq_cst();
         let (seq_no, reply_no, recv_data) = match packet {
             Payload(seq_no, recv_data) | SeqCstPayload(seq_no, recv_data) => (seq_no, None, recv_data),
@@ -413,7 +413,7 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
                 return self
                     .take_send(reply_no)
                     .map(|send_data| (RecvOkRaw::Ack { send_data }, false))
-                    .ok_or(DirectRecvError::DroppedDuplicate)
+                    .ok_or(TryRecvError::DroppedDuplicate)
             }
         };
         // We only want to accept packets with sequence numbers in the range:
@@ -436,17 +436,17 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
             // resending the packet.
             for entry in self.send_window.iter().flatten() {
                 if entry.reply_no == Some(seq_no) {
-                    return Err(DirectRecvError::DroppedDuplicate);
+                    return Err(TryRecvError::DroppedDuplicate);
                 }
             }
             for i in 0..self.concurrent_replies_total {
                 if self.concurrent_replies[i] == seq_no {
-                    return Err(DirectRecvError::DroppedDuplicate);
+                    return Err(TryRecvError::DroppedDuplicate);
                 }
             }
-            return Err(DirectRecvError::DroppedDuplicateResendAck(seq_no));
+            return Err(TryRecvError::DroppedDuplicateResendAck(seq_no));
         } else if is_above_range {
-            return Err(DirectRecvError::DroppedTooEarly);
+            return Err(TryRecvError::DroppedTooEarly);
         }
 
         // Check whether or not we've already received this packet
@@ -462,19 +462,19 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
         // If the send window is full we cannot safely process received packets,
         // because there would be no way to reply.
         // We can only process this packet if processing it would make space in the send window.
-        let (wait_recv, wait_reply) = match self.is_full_inner(false, reply_no) {
+        let (wait_recv, wait_reply) = match self.is_full_inner(reply_no) {
             Ok(()) => (seq_cst && !is_next, seq_cst && self.is_locked),
-            Err(PumpError::WaitingForRecv) => (true, false),
-            Err(PumpError::WaitingForReply) => (false, true),
+            Err(TryError::WaitingForRecv) => (true, false),
+            Err(TryError::WaitingForReply) => (false, true),
         };
         if wait_recv || wait_reply {
             if !is_duplicate {
                 self.recv_window[i] = RecvEntry::Occupied { seq_no, reply_no, seq_cst, data: recv_data.into() }
             }
             return if wait_recv {
-                Err(DirectRecvError::WaitingForRecv)
+                Err(TryRecvError::WaitingForRecv)
             } else {
-                Err(DirectRecvError::WaitingForReply)
+                Err(TryRecvError::WaitingForReply)
             };
         }
 
@@ -494,19 +494,19 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
             self.is_locked = true;
         }
         if let Some(send_data) = reply_no.and_then(|r| self.take_send(r)) {
-            Ok((RecvOkRaw::Reply { reply_no: seq_no, recv_data, send_data, seq_cst }, do_pump, true))
+            Ok((RecvOkRaw::Reply { reply_no: seq_no, recv_data, send_data, seq_cst }, do_pump))
         } else {
-            Ok((RecvOkRaw::Payload { reply_no: seq_no, recv_data, seq_cst }, do_pump, false))
+            Ok((RecvOkRaw::Payload { reply_no: seq_no, recv_data, seq_cst }, do_pump))
         }
     }
     /// If this returns `Ok` then `try_send` might succeed on next call.
-    pub fn try_pump_raw(&mut self) -> Result<(RecvOkRaw<SendData, RecvData>, bool), PumpError> {
+    pub fn try_pump_raw(&mut self) -> Result<(RecvOkRaw<SendData, RecvData>, bool), TryError> {
         let next_seq_no = self.next_recv_seq_no;
         let i = next_seq_no as usize % self.recv_window.len();
         if let RecvEntry::Occupied { seq_no, reply_no, seq_cst, .. } = &self.recv_window[i] {
             debug_assert_eq!(*seq_no, next_seq_no);
             // We cannot safely reserve a reply no if the window is full.
-            self.is_full_inner(false, *reply_no)?;
+            self.is_full_inner(*reply_no)?;
 
             if !*seq_cst || !self.is_locked {
                 let mut entry = RecvEntry::Empty;
@@ -530,10 +530,10 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
                     unreachable!();
                 }
             } else {
-                return Err(PumpError::WaitingForReply);
+                return Err(TryError::WaitingForReply);
             }
         }
-        Err(PumpError::WaitingForRecv)
+        Err(TryError::WaitingForRecv)
     }
     /// This function must be passed a reply number given by `receive_raw` or `pump_raw`, otherwise
     /// it will do nothing. This reply number can only be used to reply once.
