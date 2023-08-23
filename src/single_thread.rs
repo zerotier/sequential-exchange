@@ -26,6 +26,13 @@ impl<'a, TL: TransportLayer<SendData>, SendData, RecvData, const CAP: usize> Rep
             packet_data(seq_no, self.reply_no),
         );
     }
+
+    pub fn to_components(mut self) -> (TL, SeqNo, bool) {
+        (self.app.take().unwrap(), self.reply_no, self.is_holding_lock)
+    }
+    pub unsafe fn from_components(seq: &'a mut SeqEx<SendData, RecvData, CAP>, app: TL, reply_no: SeqNo, is_holding_lock: bool) -> Self {
+        ReplyGuard { seq, app: Some(app), reply_no, is_holding_lock }
+    }
 }
 impl<'a, TL: TransportLayer<SendData>, SendData, RecvData, const CAP: usize> Drop for ReplyGuard<'a, TL, SendData, RecvData, CAP> {
     fn drop(&mut self) {
@@ -179,7 +186,7 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
         &mut self,
         mut app: impl TransportLayer<SendData>,
         packet: Packet<P>,
-    ) -> Result<crate::seq_queue::RecvOkRaw<SendData, P>, RecvError> {
+    ) -> Result<RecvOkRaw<SendData, P>, RecvError> {
         match self.receive_raw_and_direct(packet) {
             Ok(a) => Ok(a),
             Err(DirectRecvError::DroppedDuplicateResendAck(reply_no)) => {
