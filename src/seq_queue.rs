@@ -54,7 +54,7 @@ pub struct SeqEx<SendData, RecvData, const CAP: usize = DEFAULT_WINDOW_CAP> {
     pub resend_interval: i64,
     pub next_service_timestamp: i64,
     next_send_seq_no: SeqNo,
-    pre_recv_seq_no: SeqNo,
+    next_recv_seq_no: SeqNo,
     /// This could be made more efficient by changing to SoA format.
     send_window: [Option<SendEntry<SendData>>; CAP],
     recv_window: [RecvEntry<RecvData>; CAP],
@@ -264,11 +264,12 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
     /// `initial_seq_no` is the first sequence number that this instance of `SeqEx` will use. It must be
     /// exactly the same as the `initial_seq_no` of the remote instance of `SeqEx`. It can just be 1.
     pub fn new(retry_interval: i64, initial_seq_no: SeqNo) -> Self {
+        debug_assert!(CAP > 1);
         Self {
             resend_interval: retry_interval,
             next_service_timestamp: i64::MAX,
             next_send_seq_no: initial_seq_no,
-            pre_recv_seq_no: initial_seq_no.wrapping_sub(1),
+            next_recv_seq_no: initial_seq_no,
             recv_window: core::array::from_fn(|_| RecvEntry::Empty),
             send_window: core::array::from_fn(|_| None),
             concurrent_replies: core::array::from_fn(|_| 0),
@@ -281,15 +282,22 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
         &mut self.send_window[seq_no as usize % self.send_window.len()]
     }
     #[inline]
-    fn is_full_inner(&self, is_for_reply: bool, reply_no: Option<SeqNo>) -> bool {
+    fn is_full_inner(&self, is_for_send: bool, reply_no: Option<SeqNo>) -> Result<(), PumpError> {
+        if self.concurrent_replies_total >= self.concurrent_replies.len() - 2 {
+            return Err(PumpError::WaitingForReply);
+        }
         let reply_idx = reply_no.map_or(self.send_window.len(), |r| r as usize % self.send_window.len());
-        for i in 0..self.concurrent_replies_total as u32 + 1 + is_for_reply as u32 {
+        for i in 0..1 + is_for_send as u32 + self.concurrent_replies_total as u32 {
             let idx = self.next_send_seq_no.wrapping_add(i) as usize % self.send_window.len();
             if self.send_window[idx].is_some() && reply_idx != idx {
-                return true;
+                return if i < 1 + is_for_send as u32 {
+                    Err(PumpError::WaitingForRecv)
+                } else {
+                    Err(PumpError::WaitingForReply)
+                }
             }
         }
-        false
+        Ok(())
     }
 
     #[inline]
@@ -311,14 +319,6 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
             }
         }
         false
-    }
-
-    /// Returns whether or not the send window is full.
-    /// If the send window is full calls to `SeqEx::send` will always fail.
-    pub fn is_full(&self) -> bool {
-        // We claim that the window is full one entry before it is actually full for the sake of
-        // making it always possible for both peers to process at least one reply at all times.
-        self.is_full_inner(true, None)
     }
     /// Returns the next sequence number to be attached to the next sent packet.
     /// This should be called before `SeqEx::send`, and the return value should be
@@ -348,11 +348,11 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
     /// `retry_interval`. `current_time` does not have to be monotonically increasing.
     ///
     /// Can mutate `next_service_timestamp`.
-    pub fn try_send_direct(&mut self, current_time: i64, seq_cst: bool, packet_data: SendData) -> Result<Packet<&SendData>, SendData> {
+    pub fn try_send_direct(&mut self, current_time: i64, seq_cst: bool, packet_data: SendData) -> Result<Packet<&SendData>, (PumpError, SendData)> {
         let mut tmp = Some(packet_data);
         self.try_send_direct_with(current_time, seq_cst, |_| tmp.take().unwrap())
-            .map_err(|_| ())
-            .map_err(|_| tmp.unwrap())
+            .map_err(|e| e.0)
+            .map_err(|e| (e, tmp.unwrap()))
     }
     /// Can mutate `next_service_timestamp`.
     pub fn try_send_direct_with<F: FnOnce(SeqNo) -> SendData>(
@@ -360,10 +360,11 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
         current_time: i64,
         seq_cst: bool,
         packet_data: F,
-    ) -> Result<Packet<&SendData>, F> {
-        if self.is_full() {
-            return Err(packet_data);
+    ) -> Result<Packet<&SendData>, (PumpError, F)> {
+        if let Err(e) = self.is_full_inner(true, None) {
+            return Err((e, packet_data));
         }
+
         let seq_no = self.next_send_seq_no;
         self.next_send_seq_no = self.next_send_seq_no.wrapping_add(1);
 
@@ -386,8 +387,24 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
         Ok(p)
     }
 
+    fn fast_forward(&mut self) -> bool {
+        loop {
+            let next_seq_no = self.next_recv_seq_no;
+            let i = next_seq_no as usize % self.recv_window.len();
+            match &self.recv_window[i] {
+                RecvEntry::Unlocked { seq_no } => {
+                    debug_assert_eq!(*seq_no, next_seq_no);
+                    self.recv_window[i] = RecvEntry::Empty;
+                    self.next_recv_seq_no = next_seq_no.wrapping_add(1);
+                }
+                RecvEntry::Occupied { .. } => return true,
+                RecvEntry::Empty => return false,
+            }
+        }
+    }
+
     /// If this returns `Ok` then `try_send` might succeed on next call.
-    pub fn receive_raw_and_direct<P: Into<RecvData>>(&mut self, packet: Packet<P>) -> Result<RecvOkRaw<SendData, P>, DirectRecvError> {
+    pub fn receive_raw_and_direct<P: Into<RecvData>>(&mut self, packet: Packet<P>) -> Result<(RecvOkRaw<SendData, P>, bool), DirectRecvError> {
         let seq_cst = packet.is_seq_cst();
         let (seq_no, reply_no, recv_data) = match packet {
             Payload(seq_no, recv_data) | SeqCstPayload(seq_no, recv_data) => (seq_no, None, recv_data),
@@ -395,15 +412,15 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
             Ack(reply_no) => {
                 return self
                     .take_send(reply_no)
-                    .map(|send_data| RecvOkRaw::Ack { send_data })
+                    .map(|send_data| (RecvOkRaw::Ack { send_data }, false))
                     .ok_or(DirectRecvError::DroppedDuplicate)
             }
         };
         // We only want to accept packets with sequence numbers in the range:
-        // `self.pre_recv_seq_no < seq_no <= self.pre_recv_seq_no + self.recv_window.len()`.
-        // To check that range we compute `seq_no - (self.pre_recv_seq_no + 1)` and check
+        // `self.next_recv_seq_no <= seq_no < self.next_recv_seq_no + self.recv_window.len()`.
+        // To check that range we compute `seq_no - self.next_recv_seq_no` and check
         // if the number wrapped below 0, or if it is above `self.recv_window.len()`.
-        let normalized_seq_no = seq_no.wrapping_sub(self.pre_recv_seq_no).wrapping_sub(1);
+        let normalized_seq_no = seq_no.wrapping_sub(self.next_recv_seq_no);
         let is_below_range = normalized_seq_no > SeqNo::MAX / 2;
         let is_above_range = !is_below_range && normalized_seq_no >= self.recv_window.len() as u32;
         let is_next = normalized_seq_no == 0;
@@ -445,76 +462,70 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
         // If the send window is full we cannot safely process received packets,
         // because there would be no way to reply.
         // We can only process this packet if processing it would make space in the send window.
-        let wait_for_recv = self.is_full_inner(false, reply_no) || (seq_cst && !is_next);
-        let wait_for_reply = self.concurrent_replies_total >= self.concurrent_replies.len() || (seq_cst && self.is_locked);
-        if wait_for_recv || wait_for_reply {
+        let (wait_recv, wait_reply) = match self.is_full_inner(false, reply_no) {
+            Ok(()) => (seq_cst && !is_next, seq_cst && self.is_locked),
+            Err(PumpError::WaitingForRecv) => (true, false),
+            Err(PumpError::WaitingForReply) => (false, true),
+        };
+        if wait_recv || wait_reply {
             if !is_duplicate {
                 self.recv_window[i] = RecvEntry::Occupied { seq_no, reply_no, seq_cst, data: recv_data.into() }
             }
-            return if wait_for_recv {
+            return if wait_recv {
                 Err(DirectRecvError::WaitingForRecv)
             } else {
                 Err(DirectRecvError::WaitingForReply)
             };
         }
 
-        if is_next {
+        let do_pump = if is_next {
             self.recv_window[i] = RecvEntry::Empty;
-            self.pre_recv_seq_no = seq_no;
+            self.next_recv_seq_no = seq_no.wrapping_add(1);
+            self.fast_forward()
         } else {
             debug_assert!(!seq_cst);
-            self.recv_window[i] = RecvEntry::Unlocked { seq_no }
-        }
+            self.recv_window[i] = RecvEntry::Unlocked { seq_no };
+            false
+        };
         self.concurrent_replies[self.concurrent_replies_total] = seq_no;
         self.concurrent_replies_total += 1;
         if seq_cst {
             debug_assert!(!self.is_locked);
             self.is_locked = true;
         }
-        Ok(if let Some(send_data) = reply_no.and_then(|r| self.take_send(r)) {
-            RecvOkRaw::Reply { reply_no: seq_no, recv_data, send_data, seq_cst }
+        if let Some(send_data) = reply_no.and_then(|r| self.take_send(r)) {
+            Ok((RecvOkRaw::Reply { reply_no: seq_no, recv_data, send_data, seq_cst }, do_pump, true))
         } else {
-            RecvOkRaw::Payload { reply_no: seq_no, recv_data, seq_cst }
-        })
+            Ok((RecvOkRaw::Payload { reply_no: seq_no, recv_data, seq_cst }, do_pump, false))
+        }
     }
     /// If this returns `Ok` then `try_send` might succeed on next call.
-    pub fn try_pump_raw(&mut self) -> Result<RecvOkRaw<SendData, RecvData>, PumpError> {
-        let mut next_seq_no;
-        let mut i;
-        loop {
-            next_seq_no = self.pre_recv_seq_no.wrapping_add(1);
-            i = next_seq_no as usize % self.recv_window.len();
-            if let RecvEntry::Unlocked { seq_no } = &self.recv_window[i] {
-                debug_assert_eq!(*seq_no, next_seq_no);
-                self.recv_window[i] = RecvEntry::Empty;
-                self.pre_recv_seq_no = next_seq_no;
-            } else {
-                break;
-            }
-        }
-
+    pub fn try_pump_raw(&mut self) -> Result<(RecvOkRaw<SendData, RecvData>, bool), PumpError> {
+        let next_seq_no = self.next_recv_seq_no;
+        let i = next_seq_no as usize % self.recv_window.len();
         if let RecvEntry::Occupied { seq_no, reply_no, seq_cst, .. } = &self.recv_window[i] {
             debug_assert_eq!(*seq_no, next_seq_no);
-            if self.is_full_inner(false, *reply_no) {
-                return Err(PumpError::WaitingForRecv);
-            }
+            // We cannot safely reserve a reply no if the window is full.
+            self.is_full_inner(false, *reply_no)?;
 
-            if (!*seq_cst || !self.is_locked) && self.concurrent_replies_total < self.concurrent_replies.len() {
+            if !*seq_cst || !self.is_locked {
                 let mut entry = RecvEntry::Empty;
                 core::mem::swap(&mut entry, &mut self.recv_window[i]);
                 if let RecvEntry::Occupied { seq_no, reply_no, seq_cst, data } = entry {
-                    self.pre_recv_seq_no = next_seq_no;
+                    self.next_recv_seq_no = next_seq_no.wrapping_add(1);
+                    let do_pump = self.fast_forward();
                     self.concurrent_replies[self.concurrent_replies_total] = seq_no;
                     self.concurrent_replies_total += 1;
                     if seq_cst {
                         debug_assert!(!self.is_locked);
                         self.is_locked = true;
                     }
-                    return Ok(if let Some(send_data) = reply_no.and_then(|r| self.take_send(r)) {
+                    let ret = if let Some(send_data) = reply_no.and_then(|r| self.take_send(r)) {
                         RecvOkRaw::Reply { reply_no: seq_no, seq_cst, recv_data: data, send_data }
                     } else {
                         RecvOkRaw::Payload { reply_no: seq_no, seq_cst, recv_data: data }
-                    });
+                    };
+                    return Ok((ret, do_pump));
                 } else {
                     unreachable!();
                 }
