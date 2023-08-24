@@ -30,7 +30,7 @@ pub struct ReplyGuard<'a, TL: TransportLayer<SendData>, SendData, RecvData, cons
     is_holding_lock: bool,
 }
 impl<'a, TL: TransportLayer<SendData>, SendData, RecvData, const CAP: usize> ReplyGuard<'a, TL, SendData, RecvData, CAP> {
-    fn reply_with(mut self, seq_cst: bool, packet_data: impl FnOnce(SeqNo, SeqNo) -> SendData) {
+    pub fn reply_with(mut self, seq_cst: bool, packet_data: impl FnOnce(SeqNo, SeqNo) -> SendData) {
         let app = self.app.take().unwrap();
         let mut inner = self.seq.inner.lock().unwrap();
         let seq_no = inner.seq.seq_no();
