@@ -50,7 +50,7 @@ pub const DEFAULT_WINDOW_CAP: usize = 64;
 pub struct SeqEx<SendData, RecvData, const CAP: usize = DEFAULT_WINDOW_CAP> {
     /// The interval at which packets will be resent if they have not yet been acknowledged by the
     /// remote peer.
-    /// It can be statically or dynamically set, it is up to the user to decide.
+    /// It can be statically or dynamically set.
     pub resend_interval: i64,
     pub next_service_timestamp: i64,
     next_send_seq_no: SeqNo,

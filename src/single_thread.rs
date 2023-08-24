@@ -7,28 +7,40 @@ pub struct ReplyGuard<'a, TL: TransportLayer<SendData>, SendData, RecvData, cons
     is_holding_lock: bool,
 }
 impl<'a, TL: TransportLayer<SendData>, SendData, RecvData, const CAP: usize> ReplyGuard<'a, TL, SendData, RecvData, CAP> {
+    pub fn ack(&mut self) {
+        if let Some(app) = self.app.take() {
+            self.seq.ack_raw(app, self.reply_no, self.is_holding_lock);
+        }
+    }
     /// If you need to reply more than once, say to fragment a large file, then include in your
     /// first reply some identifier, and then `send` all fragments with the same included identifier.
     /// The identifier will tell the remote peer which packets contain fragments of the file,
     /// and since each fragment will be received in order it will be trivial for them to reconstruct
     /// the original file.
+    /// # Panic
+    /// This function will panic if `ack` has been called.
     pub fn reply(self, seq_cst: bool, packet_data: SendData) {
         self.reply_with(seq_cst, |_, _| packet_data)
     }
+    /// # Panic
+    /// This function will panic if `ack` has been called.
     fn reply_with(mut self, seq_cst: bool, packet_data: impl FnOnce(SeqNo, SeqNo) -> SendData) {
-        let app = self.app.take();
+        let app = self.app.take().expect("Cannot reply after an ack has been sent");
         let seq_no = self.seq.seq_no();
         self.seq.reply_raw(
-            app.unwrap(),
+            app,
             self.reply_no,
             self.is_holding_lock,
             seq_cst,
             packet_data(seq_no, self.reply_no),
         );
+        core::mem::forget(self);
     }
 
-    pub fn to_components(mut self) -> (TL, SeqNo, bool) {
-        (self.app.take().unwrap(), self.reply_no, self.is_holding_lock)
+    pub fn to_components(self) -> (SeqNo, bool) {
+        let ret = (self.reply_no, self.is_holding_lock);
+        core::mem::forget(self);
+        ret
     }
     pub unsafe fn from_components(seq: &'a mut SeqEx<SendData, RecvData, CAP>, app: TL, reply_no: SeqNo, is_holding_lock: bool) -> Self {
         ReplyGuard { seq, app: Some(app), reply_no, is_holding_lock }
@@ -36,11 +48,7 @@ impl<'a, TL: TransportLayer<SendData>, SendData, RecvData, const CAP: usize> Rep
 }
 impl<'a, TL: TransportLayer<SendData>, SendData, RecvData, const CAP: usize> Drop for ReplyGuard<'a, TL, SendData, RecvData, CAP> {
     fn drop(&mut self) {
-        if let Some(app) = &mut self.app {
-            if let Some(p) = self.seq.ack_raw_and_direct(self.reply_no, self.is_holding_lock) {
-                app.send(p)
-            }
-        }
+        self.ack();
     }
 }
 impl<'a, TL: TransportLayer<SendData>, SendData, RecvData, const CAP: usize> std::fmt::Debug for ReplyGuard<'a, TL, SendData, RecvData, CAP> {

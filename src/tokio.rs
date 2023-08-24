@@ -12,7 +12,7 @@ type Sender<SendData, RecvData> = (oneshot::Sender<Option<(SeqNo, bool, RecvData
 type Receiver<RecvData> = (oneshot::Sender<(SeqNo, bool, RecvData)>, RecvData);
 
 pub struct SeqExTokio<SendData, RecvData, const CAP: usize = DEFAULT_WINDOW_CAP> {
-    seq_ex: Mutex<SeqExInner<SendData, RecvData, CAP>>,
+    inner: Mutex<SeqExInner<SendData, RecvData, CAP>>,
     wait_on_recv: Notify,
     wait_on_reply: Notify,
     update_queue: mpsc::Sender<i64>,
@@ -35,7 +35,7 @@ impl<'a, TL: TokioLayer<SendData = SendData>, SendData, RecvData, const CAP: usi
         ReplyGuard { seq, app: Some(app), reply_no, is_holding_lock }
     }
     fn try_reply_with_inner(&mut self, app: TL, seq_cst: bool, packet_data: impl FnOnce(SeqNo, SeqNo) -> Sender<SendData, RecvData>) -> Option<i64> {
-        let mut inner = self.seq.seq_ex.lock().unwrap();
+        let mut inner = self.seq.inner.lock().unwrap();
         let seq_no = inner.seq.seq_no();
 
         let pre_ts = inner.seq.next_service_timestamp;
@@ -47,33 +47,47 @@ impl<'a, TL: TokioLayer<SendData = SendData>, SendData, RecvData, const CAP: usi
         self.seq.notify_reply(inner);
         ret
     }
-    ///// If you need to reply more than once, say to fragment a large file, then include in your
-    ///// first reply some identifier, and then `send` all fragments with the same included identifier.
-    ///// The identifier will tell the remote peer which packets contain fragments of the file,
-    ///// and since each fragment will be received in order it will be trivial for them to reconstruct
-    ///// the original file.
+    pub fn ack(&mut self) {
+        if let Some(app) = self.app.take() {
+            let mut inner = self.seq.inner.lock().unwrap();
+            inner.seq.ack_raw(app, self.reply_no, self.is_holding_lock);
+        }
+    }
+    /// If you need to reply more than once, say to fragment a large file, then include in your
+    /// first reply some identifier, and then `send` all fragments with the same included identifier.
+    /// The identifier will tell the remote peer which packets contain fragments of the file,
+    /// and since each fragment will be received in order it will be trivial for them to reconstruct
+    /// the original file.
+    /// # Panic
+    /// This function will panic if `ack` has been called.
     pub async fn reply(self, seq_cst: bool, packet_data: SendData) -> Result<(ReplyGuard<'a, TL, SendData, RecvData, CAP>, RecvData), AsyncError> {
         self.reply_with(seq_cst, |_, _| packet_data).await
     }
+    /// # Panic
+    /// This function will panic if `ack` has been called.
     pub async fn reply_with(
         mut self,
         seq_cst: bool,
         packet_data: impl FnOnce(SeqNo, SeqNo) -> SendData,
     ) -> Result<(ReplyGuard<'a, TL, SendData, RecvData, CAP>, RecvData), AsyncError> {
-        let app = self.app.take().unwrap();
+        let app = self.app.take().expect("Cannot reply after an ack has been sent");
         let (tx, rx) = oneshot::channel();
 
         let update_ts = self.try_reply_with_inner(app.clone(), seq_cst, |s, r| (tx, packet_data(s, r)));
+        let seq = self.seq;
+        core::mem::forget(self);
 
         if let Some(update_ts) = update_ts {
-            let _ = self.seq.update_queue.send(update_ts).await;
+            let _ = seq.update_queue.send(update_ts).await;
         }
         let (reply_no, seq_cst, recv_data) = rx.await.map_err(|_| AsyncError::SeqExClosed)?.ok_or(AsyncError::EndOfExchange)?;
-        Ok((Self::new(self.seq, app, reply_no, seq_cst), recv_data))
+        Ok((Self::new(seq, app, reply_no, seq_cst), recv_data))
     }
 
-    pub fn to_components(mut self) -> (TL, SeqNo, bool) {
-        (self.app.take().unwrap(), self.reply_no, self.is_holding_lock)
+    pub fn to_components(self) -> (SeqNo, bool) {
+        let ret = (self.reply_no, self.is_holding_lock);
+        core::mem::forget(self);
+        ret
     }
     pub unsafe fn from_components(seq: &'a SeqExTokio<SendData, RecvData, CAP>, app: TL, reply_no: SeqNo, is_holding_lock: bool) -> Self {
         Self::new(seq, app, reply_no, is_holding_lock)
@@ -81,11 +95,11 @@ impl<'a, TL: TokioLayer<SendData = SendData>, SendData, RecvData, const CAP: usi
 }
 impl<'a, TL: TokioLayer<SendData = SendData>, SendData, RecvData, const CAP: usize> Drop for ReplyGuard<'a, TL, SendData, RecvData, CAP> {
     fn drop(&mut self) {
+        let mut inner = self.seq.inner.lock().unwrap();
         if let Some(app) = self.app.take() {
-            let mut inner = self.seq.seq_ex.lock().unwrap();
             inner.seq.ack_raw(app, self.reply_no, self.is_holding_lock);
-            self.seq.notify_reply(inner);
         }
+        self.seq.notify_reply(inner);
     }
 }
 impl<'a, TL: TokioLayer<SendData = SendData>, SendData, RecvData, const CAP: usize> std::fmt::Debug for ReplyGuard<'a, TL, SendData, RecvData, CAP> {
@@ -150,7 +164,7 @@ impl<SendData, RecvData, const CAP: usize> SeqExTokio<SendData, RecvData, CAP> {
         let (update_queue, recv_service_update) = mpsc::channel(8);
         (
             Self {
-                seq_ex: Mutex::new(SeqExInner {
+                inner: Mutex::new(SeqExInner {
                     seq: SeqEx::new(retry_interval, initial_seq_no),
                     recv_waiters: 0,
                     reply_waiters: false,
@@ -178,7 +192,7 @@ impl<SendData, RecvData, const CAP: usize> SeqExTokio<SendData, RecvData, CAP> {
         app: TL,
         packet: Packet<IntoOneshot<'_, RecvData>>,
     ) -> Result<(ReplyGuard<'_, TL, SendData, RecvData, CAP>, RecvData), Option<AsyncRecvError>> {
-        let mut inner = self.seq_ex.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap();
         return match inner.seq.receive_raw(app.clone(), packet) {
             Ok((recv_data, do_pump)) => {
                 // pump first, handle return value second.
@@ -267,7 +281,7 @@ impl<SendData, RecvData, const CAP: usize> SeqExTokio<SendData, RecvData, CAP> {
         seq_cst: bool,
         packet_data: F,
     ) -> Result<Option<i64>, (TryError, F)> {
-        let mut inner = self.seq_ex.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap();
         let pre_ts = inner.seq.next_service_timestamp;
         let result = inner.seq.try_send_with(app, seq_cst, packet_data);
         match result {
@@ -338,7 +352,7 @@ impl<SendData, RecvData, const CAP: usize> SeqExTokio<SendData, RecvData, CAP> {
         if let Some(up) = result {
             state.next_service_timestamp = state.next_service_timestamp.min(up);
         } else {
-            let mut inner = self.seq_ex.lock().unwrap();
+            let mut inner = self.inner.lock().unwrap();
             inner.seq.service(app.clone());
             state.next_service_timestamp = inner.seq.next_service_timestamp;
         }
