@@ -294,7 +294,7 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
                     Err(TryError::WaitingForRecv)
                 } else {
                     Err(TryError::WaitingForReply)
-                }
+                };
             }
         }
         Ok(())

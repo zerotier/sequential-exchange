@@ -4,7 +4,9 @@ use tokio::{
     time,
 };
 
-use crate::{Packet, TryError, RecvOkRaw, SeqEx, SeqNo, TransportLayer, DEFAULT_INITIAL_SEQ_NO, DEFAULT_RESEND_INTERVAL_MS, DEFAULT_WINDOW_CAP, RecvError};
+use crate::{
+    Packet, RecvError, RecvOkRaw, SeqEx, SeqNo, TransportLayer, TryError, DEFAULT_INITIAL_SEQ_NO, DEFAULT_RESEND_INTERVAL_MS, DEFAULT_WINDOW_CAP,
+};
 
 type Sender<SendData, RecvData> = (oneshot::Sender<Option<(SeqNo, bool, RecvData)>>, SendData);
 type Receiver<RecvData> = (oneshot::Sender<(SeqNo, bool, RecvData)>, RecvData);
@@ -37,7 +39,8 @@ impl<'a, TL: TokioLayer<SendData = SendData>, SendData, RecvData, const CAP: usi
         let seq_no = inner.seq.seq_no();
 
         let pre_ts = inner.seq.next_service_timestamp;
-        inner.seq
+        inner
+            .seq
             .reply_raw(app, self.reply_no, self.is_holding_lock, seq_cst, packet_data(seq_no, self.reply_no));
         let ret = (pre_ts != inner.seq.next_service_timestamp).then_some(inner.seq.next_service_timestamp);
 
@@ -134,11 +137,11 @@ pub struct ServiceState {
 }
 
 struct IntoOneshot<'a, RecvData>(RecvData, &'a mut Option<oneshot::Receiver<(SeqNo, bool, RecvData)>>);
-impl<'a, RecvData> Into<Receiver<RecvData>> for IntoOneshot<'a, RecvData> {
-    fn into(self) -> Receiver<RecvData> {
+impl<'a, RecvData> From<IntoOneshot<'a, RecvData>> for Receiver<RecvData> {
+    fn from(value: IntoOneshot<'a, RecvData>) -> Self {
         let (rx, tx) = oneshot::channel();
-        *self.1 = Some(tx);
-        (rx, self.0)
+        *value.1 = Some(tx);
+        (rx, value.0)
     }
 }
 
@@ -147,7 +150,11 @@ impl<SendData, RecvData, const CAP: usize> SeqExTokio<SendData, RecvData, CAP> {
         let (update_queue, recv_service_update) = mpsc::channel(8);
         (
             Self {
-                seq_ex: Mutex::new(SeqExInner { seq: SeqEx::new(retry_interval, initial_seq_no), recv_waiters: 0, reply_waiters: false }),
+                seq_ex: Mutex::new(SeqExInner {
+                    seq: SeqEx::new(retry_interval, initial_seq_no),
+                    recv_waiters: 0,
+                    reply_waiters: false,
+                }),
                 wait_on_recv: Notify::new(),
                 wait_on_reply: Notify::new(),
                 update_queue,
@@ -243,11 +250,13 @@ impl<SendData, RecvData, const CAP: usize> SeqExTokio<SendData, RecvData, CAP> {
         match self.receive_inner(app.clone(), packet) {
             Ok(ret) => Ok(ret),
             Err(Some(e)) => Err(e),
-            Err(None) => if let Some(tx) = tx {
-                let (reply_no, is_holding_lock, data) = tx.await.map_err(|_| AsyncRecvError::SeqExClosed)?;
-                Ok((ReplyGuard::new(self, app, reply_no, is_holding_lock), data))
-            } else {
-                Err(AsyncRecvError::DroppedDuplicate)
+            Err(None) => {
+                if let Some(tx) = tx {
+                    let (reply_no, is_holding_lock, data) = tx.await.map_err(|_| AsyncRecvError::SeqExClosed)?;
+                    Ok((ReplyGuard::new(self, app, reply_no, is_holding_lock), data))
+                } else {
+                    Err(AsyncRecvError::DroppedDuplicate)
+                }
             }
         }
     }
@@ -270,7 +279,7 @@ impl<SendData, RecvData, const CAP: usize> SeqExTokio<SendData, RecvData, CAP> {
                 inner.reply_waiters = true;
                 Err((TryError::WaitingForReply, p))
             }
-            Ok(()) => Ok((pre_ts != inner.seq.next_service_timestamp).then_some(inner.seq.next_service_timestamp))
+            Ok(()) => Ok((pre_ts != inner.seq.next_service_timestamp).then_some(inner.seq.next_service_timestamp)),
         }
     }
 

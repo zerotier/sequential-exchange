@@ -7,7 +7,7 @@ use std::{
 };
 
 use crate::{
-    Packet, TryError, RecvError, RecvOkRaw, SeqEx, SeqNo, TransportLayer, DEFAULT_INITIAL_SEQ_NO, DEFAULT_RESEND_INTERVAL_MS, DEFAULT_WINDOW_CAP,
+    Packet, RecvError, RecvOkRaw, SeqEx, SeqNo, TransportLayer, TryError, DEFAULT_INITIAL_SEQ_NO, DEFAULT_RESEND_INTERVAL_MS, DEFAULT_WINDOW_CAP,
 };
 
 pub struct SeqExSync<SendData, RecvData, const CAP: usize = DEFAULT_WINDOW_CAP> {
@@ -34,7 +34,8 @@ impl<'a, TL: TransportLayer<SendData>, SendData, RecvData, const CAP: usize> Rep
         let app = self.app.take().unwrap();
         let mut inner = self.seq.inner.lock().unwrap();
         let seq_no = inner.seq.seq_no();
-        inner.seq
+        inner
+            .seq
             .reply_raw(app, self.reply_no, self.is_holding_lock, seq_cst, packet_data(seq_no, self.reply_no));
         self.seq.notify_reply(inner);
     }
@@ -98,7 +99,12 @@ pub struct RecvIter<'a, TL: TransportLayer<SendData>, SendData, RecvData, const 
 impl<SendData, RecvData, const CAP: usize> SeqExSync<SendData, RecvData, CAP> {
     pub fn new(retry_interval: i64, initial_seq_no: SeqNo) -> Self {
         Self {
-            inner: Mutex::new(SeqExInner { seq: SeqEx::new(retry_interval, initial_seq_no), recv_waiters: 0, reply_sender_waiters: false, reply_receiver_waiters: false }),
+            inner: Mutex::new(SeqExInner {
+                seq: SeqEx::new(retry_interval, initial_seq_no),
+                recv_waiters: 0,
+                reply_sender_waiters: false,
+                reply_receiver_waiters: false,
+            }),
             wait_on_recv: Condvar::default(),
             wait_on_reply_receiver: Condvar::default(),
             wait_on_reply_sender: Condvar::default(),
@@ -180,32 +186,39 @@ impl<SendData, RecvData, const CAP: usize> SeqExSync<SendData, RecvData, CAP> {
         }
     }
 
-    pub fn receive_all<TL: TransportLayer<SendData>>(
-        &self,
-        app: TL,
-        packet: Packet<RecvData>,
-    ) -> RecvIter<'_, TL, SendData, RecvData, CAP> {
+    pub fn receive_all<TL: TransportLayer<SendData>>(&self, app: TL, packet: Packet<RecvData>) -> RecvIter<'_, TL, SendData, RecvData, CAP> {
         let ret = self.receive(app.clone(), packet);
         if let Some((first, do_pump)) = ret {
-            RecvIter { seq: do_pump.then_some(self), app, first: Some(first), blocking: true }
+            RecvIter {
+                seq: do_pump.then_some(self),
+                app,
+                first: Some(first),
+                blocking: true,
+            }
         } else {
             RecvIter { seq: None, app, first: None, blocking: true }
         }
     }
-    pub fn try_receive_all<TL: TransportLayer<SendData>>(
-        &self,
-        app: TL,
-        packet: Packet<RecvData>,
-    ) -> RecvIter<'_, TL, SendData, RecvData, CAP> {
+    pub fn try_receive_all<TL: TransportLayer<SendData>>(&self, app: TL, packet: Packet<RecvData>) -> RecvIter<'_, TL, SendData, RecvData, CAP> {
         let ret = self.try_receive(app.clone(), packet);
         if let Ok((first, do_pump)) = ret {
-            RecvIter { seq: do_pump.then_some(self), app, first: Some(first), blocking: false }
+            RecvIter {
+                seq: do_pump.then_some(self),
+                app,
+                first: Some(first),
+                blocking: false,
+            }
         } else {
             RecvIter { seq: None, app, first: None, blocking: false }
         }
     }
 
-    pub fn try_send_with<TL: TransportLayer<SendData>, F: FnOnce(SeqNo) -> SendData>(&self, app: TL, seq_cst: bool, packet_data: F) -> Result<(), (TryError, F)> {
+    pub fn try_send_with<TL: TransportLayer<SendData>, F: FnOnce(SeqNo) -> SendData>(
+        &self,
+        app: TL,
+        seq_cst: bool,
+        packet_data: F,
+    ) -> Result<(), (TryError, F)> {
         let mut inner = self.inner.lock().unwrap();
         inner.seq.try_send_with(app, seq_cst, packet_data)
     }
@@ -257,9 +270,7 @@ impl<SendData, RecvData, const CAP: usize> Default for SeqExSync<SendData, RecvD
     }
 }
 
-impl<'a, TL: TransportLayer<SendData>, SendData, RecvData, const CAP: usize> Iterator
-    for RecvIter<'a, TL, SendData, RecvData, CAP>
-{
+impl<'a, TL: TransportLayer<SendData>, SendData, RecvData, const CAP: usize> Iterator for RecvIter<'a, TL, SendData, RecvData, CAP> {
     type Item = RecvOk<'a, TL, SendData, RecvData, CAP>;
     fn next(&mut self) -> Option<Self::Item> {
         if let Some(item) = self.first.take() {

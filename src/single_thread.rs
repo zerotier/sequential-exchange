@@ -1,4 +1,4 @@
-use crate::{TryRecvError, Packet, TryError, RecvOkRaw, SeqEx, SeqNo, TransportLayer, DEFAULT_WINDOW_CAP};
+use crate::{Packet, RecvOkRaw, SeqEx, SeqNo, TransportLayer, TryError, TryRecvError, DEFAULT_WINDOW_CAP};
 
 pub struct ReplyGuard<'a, TL: TransportLayer<SendData>, SendData, RecvData, const CAP: usize = DEFAULT_WINDOW_CAP> {
     seq: &'a mut SeqEx<SendData, RecvData, CAP>,
@@ -225,7 +225,8 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
         app: TL,
         packet: Packet<RecvData>,
     ) -> Result<(RecvOk<'_, TL, SendData, RecvData, CAP>, bool), RecvError> {
-        self.receive_raw(app.clone(), packet).map(|(r, do_pump)| (RecvOk::from_raw(self, app, r), do_pump))
+        self.receive_raw(app.clone(), packet)
+            .map(|(r, do_pump)| (RecvOk::from_raw(self, app, r), do_pump))
     }
     pub fn try_pump<TL: TransportLayer<SendData>>(&mut self, app: TL) -> Result<(RecvOk<'_, TL, SendData, RecvData, CAP>, bool), TryError> {
         self.try_pump_raw().map(|(r, do_pump)| (RecvOk::from_raw(self, app, r), do_pump))

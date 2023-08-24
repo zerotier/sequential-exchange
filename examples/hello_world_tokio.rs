@@ -75,8 +75,7 @@ fn peer_main(transport: MpscTransport<Payload>, mut recv: mpsc::Receiver<Packet<
             if let Some(peer) = peer_weak.upgrade() {
                 let tl = transport.clone();
                 task::spawn(async move {
-                    let result = peer.receive(&tl, packet).await;
-                    if let Ok((g, payload)) = result {
+                    if let Ok((g, payload)) = peer.receive(&tl, packet).await {
                         receive(g, payload).await;
                     }
                 });
