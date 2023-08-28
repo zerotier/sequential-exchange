@@ -40,7 +40,7 @@
 pub type SeqNo = u32;
 
 /// The resend interval for a default instance of SeqEx.
-pub const DEFAULT_RESEND_INTERVAL_MS: i64 = 200;
+pub const DEFAULT_RESEND_INTERVAL_MS: i64 = 250;
 /// The initial sequence number for a default instance of SeqEx.
 pub const DEFAULT_INITIAL_SEQ_NO: SeqNo = 0;
 
