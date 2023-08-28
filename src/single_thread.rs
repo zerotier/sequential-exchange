@@ -27,13 +27,8 @@ impl<'a, TL: TransportLayer<SendData>, SendData, RecvData, const CAP: usize> Rep
     fn reply_with(mut self, seq_cst: bool, packet_data: impl FnOnce(SeqNo, SeqNo) -> SendData) {
         let app = self.app.take().expect("Cannot reply after an ack has been sent");
         let seq_no = self.seq.seq_no();
-        self.seq.reply_raw(
-            app,
-            self.reply_no,
-            self.is_holding_lock,
-            seq_cst,
-            packet_data(seq_no, self.reply_no),
-        );
+        self.seq
+            .reply_raw(app, self.reply_no, self.is_holding_lock, seq_cst, packet_data(seq_no, self.reply_no));
         core::mem::forget(self);
     }
 

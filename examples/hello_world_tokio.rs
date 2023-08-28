@@ -96,6 +96,7 @@ async fn main() {
 
     say_hello(&peer1, &transport1).await;
 }
+
 #[test]
 fn test() {
     main()

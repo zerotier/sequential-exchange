@@ -91,6 +91,17 @@ struct SendEntry<SendData> {
     next_resend_time: i64,
     data: SendData,
 }
+impl<SendData> SendEntry<SendData> {
+    fn to_packet(&self) -> Packet<&SendData> {
+        let mut p = if let Some(reply_no) = self.reply_no {
+            Reply(self.seq_no, reply_no, &self.data)
+        } else {
+            Payload(self.seq_no, &self.data)
+        };
+        p.set_seq_cst(self.seq_cst);
+        p
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TryRecvError {
@@ -249,7 +260,7 @@ pub struct IterMut<'a, SendData>(core::slice::IterMut<'a, Option<SendEntry<SendD
 
 #[derive(Clone, Debug)]
 pub struct ServiceIter {
-    idx: usize,
+    seq_no: SeqNo,
     next_time: i64,
 }
 
@@ -382,9 +393,7 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
             data: packet_data(seq_no),
         });
 
-        let mut p = Payload(entry.seq_no, &entry.data);
-        p.set_seq_cst(seq_cst);
-        Ok(p)
+        Ok(entry.to_packet())
     }
 
     fn fast_forward(&mut self) -> bool {
@@ -577,9 +586,7 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
                 data: packet_data,
             });
 
-            let mut p = Reply(entry.seq_no, reply_no, &entry.data);
-            p.set_seq_cst(seq_cst);
-            Some(p)
+            Some(entry.to_packet())
         } else {
             None
         }
@@ -601,22 +608,19 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
     /// Can mutate `next_service_timestamp`.
     pub fn service_direct(&mut self, current_time: i64, iter: &mut Option<ServiceIter>) -> Option<Packet<&SendData>> {
         if self.next_service_timestamp <= current_time {
-            let iter = iter.get_or_insert(ServiceIter { idx: 0, next_time: i64::MAX });
-            while let Some(entry) = self.send_window.get(iter.idx) {
-                iter.idx += 1;
-                if let Some(entry) = entry {
+            let iter = iter.get_or_insert(ServiceIter {
+                seq_no: self.next_send_seq_no.wrapping_sub(self.send_window.len() as u32),
+                next_time: i64::MAX,
+            });
+            while iter.seq_no != self.next_send_seq_no {
+                let idx = iter.seq_no as usize % self.send_window.len();
+                iter.seq_no = iter.seq_no.wrapping_add(1);
+                if let Some(entry) = &mut self.send_window[idx] {
                     if entry.next_resend_time <= current_time {
-                        let entry = self.send_window[iter.idx - 1].as_mut().unwrap();
                         entry.next_resend_time = current_time + self.resend_interval;
                         iter.next_time = iter.next_time.min(entry.next_resend_time);
 
-                        let mut p = if let Some(reply_no) = entry.reply_no {
-                            Reply(entry.seq_no, reply_no, &entry.data)
-                        } else {
-                            Payload(entry.seq_no, &entry.data)
-                        };
-                        p.set_seq_cst(entry.seq_cst);
-                        return Some(p);
+                        return Some(self.send_window[idx].as_ref().unwrap().to_packet());
                     } else {
                         iter.next_time = iter.next_time.min(entry.next_resend_time);
                     }
