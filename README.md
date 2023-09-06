@@ -13,7 +13,7 @@ exchange.
 SEP guarantees both peers will agree upon which packets are members of which exchanges,
 and it guarantees each packet is received by each peer in sequential order.
 
-SEP is a tiny, dead simple protocol and we have implemented it here in less than 500 lines of code.
+SEP is a tiny, dead simple protocol, the core of which we have implemented in less than 1000 lines of code.
 
 ## Why not TCP?
 
