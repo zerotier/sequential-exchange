@@ -40,7 +40,7 @@
 pub type SeqNo = u32;
 
 /// The resend interval for a default instance of SeqEx.
-pub const DEFAULT_RESEND_INTERVAL_MS: i64 = 200;
+pub const DEFAULT_RESEND_INTERVAL_MS: i64 = 250;
 /// The initial sequence number for a default instance of SeqEx.
 pub const DEFAULT_INITIAL_SEQ_NO: SeqNo = 0;
 
@@ -50,11 +50,11 @@ pub const DEFAULT_WINDOW_CAP: usize = 64;
 pub struct SeqEx<SendData, RecvData, const CAP: usize = DEFAULT_WINDOW_CAP> {
     /// The interval at which packets will be resent if they have not yet been acknowledged by the
     /// remote peer.
-    /// It can be statically or dynamically set, it is up to the user to decide.
+    /// It can be statically or dynamically set.
     pub resend_interval: i64,
     pub next_service_timestamp: i64,
     next_send_seq_no: SeqNo,
-    pre_recv_seq_no: SeqNo,
+    next_recv_seq_no: SeqNo,
     /// This could be made more efficient by changing to SoA format.
     send_window: [Option<SendEntry<SendData>>; CAP],
     recv_window: [RecvEntry<RecvData>; CAP],
@@ -91,9 +91,20 @@ struct SendEntry<SendData> {
     next_resend_time: i64,
     data: SendData,
 }
+impl<SendData> SendEntry<SendData> {
+    fn to_packet(&self) -> Packet<&SendData> {
+        let mut p = if let Some(reply_no) = self.reply_no {
+            Reply(self.seq_no, reply_no, &self.data)
+        } else {
+            Payload(self.seq_no, &self.data)
+        };
+        p.set_seq_cst(self.seq_cst);
+        p
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DirectRecvError {
+pub enum TryRecvError {
     DroppedTooEarly,
     DroppedDuplicate,
     DroppedDuplicateResendAck(SeqNo),
@@ -101,36 +112,36 @@ pub enum DirectRecvError {
     WaitingForReply,
 }
 #[cfg(feature = "std")]
-impl std::fmt::Display for DirectRecvError {
+impl std::fmt::Display for TryRecvError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            DirectRecvError::DroppedTooEarly => write!(f, "packet arrived too early"),
-            DirectRecvError::DroppedDuplicate => write!(f, "packet was a duplicate"),
-            DirectRecvError::DroppedDuplicateResendAck(_) => write!(f, "packet was a duplicate, resending ack"),
-            DirectRecvError::WaitingForRecv => write!(f, "can't process until another packet is received"),
-            DirectRecvError::WaitingForReply => write!(f, "can't process until a reply is finished"),
+            TryRecvError::DroppedTooEarly => write!(f, "packet arrived too early"),
+            TryRecvError::DroppedDuplicate => write!(f, "packet was a duplicate"),
+            TryRecvError::DroppedDuplicateResendAck(_) => write!(f, "packet was a duplicate, resending ack"),
+            TryRecvError::WaitingForRecv => write!(f, "can't process until another packet is received"),
+            TryRecvError::WaitingForReply => write!(f, "can't process until a reply is finished"),
         }
     }
 }
 #[cfg(feature = "std")]
-impl std::error::Error for DirectRecvError {}
+impl std::error::Error for TryRecvError {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PumpError {
+pub enum TryError {
     WaitingForRecv,
     WaitingForReply,
 }
 #[cfg(feature = "std")]
-impl std::fmt::Display for PumpError {
+impl std::fmt::Display for TryError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            PumpError::WaitingForRecv => write!(f, "can't process until another packet is received"),
-            PumpError::WaitingForReply => write!(f, "can't process until a reply is finished"),
+            TryError::WaitingForRecv => write!(f, "can't process until another packet is received"),
+            TryError::WaitingForReply => write!(f, "can't process until a reply is finished"),
         }
     }
 }
 #[cfg(feature = "std")]
-impl std::error::Error for PumpError {}
+impl std::error::Error for TryError {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -249,7 +260,7 @@ pub struct IterMut<'a, SendData>(core::slice::IterMut<'a, Option<SendEntry<SendD
 
 #[derive(Clone, Debug)]
 pub struct ServiceIter {
-    idx: usize,
+    seq_no: SeqNo,
     next_time: i64,
 }
 
@@ -264,11 +275,12 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
     /// `initial_seq_no` is the first sequence number that this instance of `SeqEx` will use. It must be
     /// exactly the same as the `initial_seq_no` of the remote instance of `SeqEx`. It can just be 1.
     pub fn new(retry_interval: i64, initial_seq_no: SeqNo) -> Self {
+        debug_assert!(CAP > 1);
         Self {
             resend_interval: retry_interval,
             next_service_timestamp: i64::MAX,
             next_send_seq_no: initial_seq_no,
-            pre_recv_seq_no: initial_seq_no.wrapping_sub(1),
+            next_recv_seq_no: initial_seq_no,
             recv_window: core::array::from_fn(|_| RecvEntry::Empty),
             send_window: core::array::from_fn(|_| None),
             concurrent_replies: core::array::from_fn(|_| 0),
@@ -281,15 +293,22 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
         &mut self.send_window[seq_no as usize % self.send_window.len()]
     }
     #[inline]
-    fn is_full_inner(&self, is_for_reply: bool, reply_no: Option<SeqNo>) -> bool {
+    fn is_full_inner(&self, reply_no: Option<SeqNo>) -> Result<(), TryError> {
+        if self.concurrent_replies_total >= self.concurrent_replies.len() - 2 {
+            return Err(TryError::WaitingForReply);
+        }
         let reply_idx = reply_no.map_or(self.send_window.len(), |r| r as usize % self.send_window.len());
-        for i in 0..self.concurrent_replies_total as u32 + 1 + is_for_reply as u32 {
+        for i in 0..1 + self.concurrent_replies_total as u32 {
             let idx = self.next_send_seq_no.wrapping_add(i) as usize % self.send_window.len();
             if self.send_window[idx].is_some() && reply_idx != idx {
-                return true;
+                return if i == 0 {
+                    Err(TryError::WaitingForRecv)
+                } else {
+                    Err(TryError::WaitingForReply)
+                };
             }
         }
-        false
+        Ok(())
     }
 
     #[inline]
@@ -311,14 +330,6 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
             }
         }
         false
-    }
-
-    /// Returns whether or not the send window is full.
-    /// If the send window is full calls to `SeqEx::send` will always fail.
-    pub fn is_full(&self) -> bool {
-        // We claim that the window is full one entry before it is actually full for the sake of
-        // making it always possible for both peers to process at least one reply at all times.
-        self.is_full_inner(true, None)
     }
     /// Returns the next sequence number to be attached to the next sent packet.
     /// This should be called before `SeqEx::send`, and the return value should be
@@ -348,11 +359,11 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
     /// `retry_interval`. `current_time` does not have to be monotonically increasing.
     ///
     /// Can mutate `next_service_timestamp`.
-    pub fn try_send_direct(&mut self, current_time: i64, seq_cst: bool, packet_data: SendData) -> Result<Packet<&SendData>, SendData> {
+    pub fn try_send_direct(&mut self, current_time: i64, seq_cst: bool, packet_data: SendData) -> Result<Packet<&SendData>, (TryError, SendData)> {
         let mut tmp = Some(packet_data);
         self.try_send_direct_with(current_time, seq_cst, |_| tmp.take().unwrap())
-            .map_err(|_| ())
-            .map_err(|_| tmp.unwrap())
+            .map_err(|e| e.0)
+            .map_err(|e| (e, tmp.unwrap()))
     }
     /// Can mutate `next_service_timestamp`.
     pub fn try_send_direct_with<F: FnOnce(SeqNo) -> SendData>(
@@ -360,10 +371,11 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
         current_time: i64,
         seq_cst: bool,
         packet_data: F,
-    ) -> Result<Packet<&SendData>, F> {
-        if self.is_full() {
-            return Err(packet_data);
+    ) -> Result<Packet<&SendData>, (TryError, F)> {
+        if let Err(e) = self.is_full_inner(None) {
+            return Err((e, packet_data));
         }
+
         let seq_no = self.next_send_seq_no;
         self.next_send_seq_no = self.next_send_seq_no.wrapping_add(1);
 
@@ -381,13 +393,27 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
             data: packet_data(seq_no),
         });
 
-        let mut p = Payload(entry.seq_no, &entry.data);
-        p.set_seq_cst(seq_cst);
-        Ok(p)
+        Ok(entry.to_packet())
+    }
+
+    fn fast_forward(&mut self) -> bool {
+        loop {
+            let next_seq_no = self.next_recv_seq_no;
+            let i = next_seq_no as usize % self.recv_window.len();
+            match &self.recv_window[i] {
+                RecvEntry::Unlocked { seq_no } => {
+                    debug_assert_eq!(*seq_no, next_seq_no);
+                    self.recv_window[i] = RecvEntry::Empty;
+                    self.next_recv_seq_no = next_seq_no.wrapping_add(1);
+                }
+                RecvEntry::Occupied { .. } => return true,
+                RecvEntry::Empty => return false,
+            }
+        }
     }
 
     /// If this returns `Ok` then `try_send` might succeed on next call.
-    pub fn receive_raw_and_direct<P: Into<RecvData>>(&mut self, packet: Packet<P>) -> Result<RecvOkRaw<SendData, P>, DirectRecvError> {
+    pub fn receive_raw_and_direct<P: Into<RecvData>>(&mut self, packet: Packet<P>) -> Result<(RecvOkRaw<SendData, P>, bool), TryRecvError> {
         let seq_cst = packet.is_seq_cst();
         let (seq_no, reply_no, recv_data) = match packet {
             Payload(seq_no, recv_data) | SeqCstPayload(seq_no, recv_data) => (seq_no, None, recv_data),
@@ -395,15 +421,15 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
             Ack(reply_no) => {
                 return self
                     .take_send(reply_no)
-                    .map(|send_data| RecvOkRaw::Ack { send_data })
-                    .ok_or(DirectRecvError::DroppedDuplicate)
+                    .map(|send_data| (RecvOkRaw::Ack { send_data }, false))
+                    .ok_or(TryRecvError::DroppedDuplicate)
             }
         };
         // We only want to accept packets with sequence numbers in the range:
-        // `self.pre_recv_seq_no < seq_no <= self.pre_recv_seq_no + self.recv_window.len()`.
-        // To check that range we compute `seq_no - (self.pre_recv_seq_no + 1)` and check
+        // `self.next_recv_seq_no <= seq_no < self.next_recv_seq_no + self.recv_window.len()`.
+        // To check that range we compute `seq_no - self.next_recv_seq_no` and check
         // if the number wrapped below 0, or if it is above `self.recv_window.len()`.
-        let normalized_seq_no = seq_no.wrapping_sub(self.pre_recv_seq_no).wrapping_sub(1);
+        let normalized_seq_no = seq_no.wrapping_sub(self.next_recv_seq_no);
         let is_below_range = normalized_seq_no > SeqNo::MAX / 2;
         let is_above_range = !is_below_range && normalized_seq_no >= self.recv_window.len() as u32;
         let is_next = normalized_seq_no == 0;
@@ -419,17 +445,17 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
             // resending the packet.
             for entry in self.send_window.iter().flatten() {
                 if entry.reply_no == Some(seq_no) {
-                    return Err(DirectRecvError::DroppedDuplicate);
+                    return Err(TryRecvError::DroppedDuplicate);
                 }
             }
             for i in 0..self.concurrent_replies_total {
                 if self.concurrent_replies[i] == seq_no {
-                    return Err(DirectRecvError::DroppedDuplicate);
+                    return Err(TryRecvError::DroppedDuplicate);
                 }
             }
-            return Err(DirectRecvError::DroppedDuplicateResendAck(seq_no));
+            return Err(TryRecvError::DroppedDuplicateResendAck(seq_no));
         } else if is_above_range {
-            return Err(DirectRecvError::DroppedTooEarly);
+            return Err(TryRecvError::DroppedTooEarly);
         }
 
         // Check whether or not we've already received this packet
@@ -445,84 +471,78 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
         // If the send window is full we cannot safely process received packets,
         // because there would be no way to reply.
         // We can only process this packet if processing it would make space in the send window.
-        let wait_for_recv = self.is_full_inner(false, reply_no) || (seq_cst && !is_next);
-        let wait_for_reply = self.concurrent_replies_total >= self.concurrent_replies.len() || (seq_cst && self.is_locked);
-        if wait_for_recv || wait_for_reply {
+        let (wait_recv, wait_reply) = match self.is_full_inner(reply_no) {
+            Ok(()) => (seq_cst && !is_next, seq_cst && self.is_locked),
+            Err(TryError::WaitingForRecv) => (true, false),
+            Err(TryError::WaitingForReply) => (false, true),
+        };
+        if wait_recv || wait_reply {
             if !is_duplicate {
                 self.recv_window[i] = RecvEntry::Occupied { seq_no, reply_no, seq_cst, data: recv_data.into() }
             }
-            return if wait_for_recv {
-                Err(DirectRecvError::WaitingForRecv)
+            return if wait_recv {
+                Err(TryRecvError::WaitingForRecv)
             } else {
-                Err(DirectRecvError::WaitingForReply)
+                Err(TryRecvError::WaitingForReply)
             };
         }
 
-        if is_next {
+        let do_pump = if is_next {
             self.recv_window[i] = RecvEntry::Empty;
-            self.pre_recv_seq_no = seq_no;
+            self.next_recv_seq_no = seq_no.wrapping_add(1);
+            self.fast_forward()
         } else {
             debug_assert!(!seq_cst);
-            self.recv_window[i] = RecvEntry::Unlocked { seq_no }
-        }
+            self.recv_window[i] = RecvEntry::Unlocked { seq_no };
+            false
+        };
         self.concurrent_replies[self.concurrent_replies_total] = seq_no;
         self.concurrent_replies_total += 1;
         if seq_cst {
             debug_assert!(!self.is_locked);
             self.is_locked = true;
         }
-        Ok(if let Some(send_data) = reply_no.and_then(|r| self.take_send(r)) {
-            RecvOkRaw::Reply { reply_no: seq_no, recv_data, send_data, seq_cst }
+        if let Some(send_data) = reply_no.and_then(|r| self.take_send(r)) {
+            Ok((RecvOkRaw::Reply { reply_no: seq_no, recv_data, send_data, seq_cst }, do_pump))
         } else {
-            RecvOkRaw::Payload { reply_no: seq_no, recv_data, seq_cst }
-        })
+            Ok((RecvOkRaw::Payload { reply_no: seq_no, recv_data, seq_cst }, do_pump))
+        }
     }
     /// If this returns `Ok` then `try_send` might succeed on next call.
-    pub fn try_pump_raw(&mut self) -> Result<RecvOkRaw<SendData, RecvData>, PumpError> {
-        let mut next_seq_no;
-        let mut i;
-        loop {
-            next_seq_no = self.pre_recv_seq_no.wrapping_add(1);
-            i = next_seq_no as usize % self.recv_window.len();
-            if let RecvEntry::Unlocked { seq_no } = &self.recv_window[i] {
-                debug_assert_eq!(*seq_no, next_seq_no);
-                self.recv_window[i] = RecvEntry::Empty;
-                self.pre_recv_seq_no = next_seq_no;
-            } else {
-                break;
-            }
-        }
-
+    pub fn try_pump_raw(&mut self) -> Result<(RecvOkRaw<SendData, RecvData>, bool), TryError> {
+        let next_seq_no = self.next_recv_seq_no;
+        let i = next_seq_no as usize % self.recv_window.len();
         if let RecvEntry::Occupied { seq_no, reply_no, seq_cst, .. } = &self.recv_window[i] {
             debug_assert_eq!(*seq_no, next_seq_no);
-            if self.is_full_inner(false, *reply_no) {
-                return Err(PumpError::WaitingForRecv);
-            }
+            // We cannot safely reserve a reply no if the window is full.
+            self.is_full_inner(*reply_no)?;
 
-            if (!*seq_cst || !self.is_locked) && self.concurrent_replies_total < self.concurrent_replies.len() {
+            if !*seq_cst || !self.is_locked {
                 let mut entry = RecvEntry::Empty;
                 core::mem::swap(&mut entry, &mut self.recv_window[i]);
                 if let RecvEntry::Occupied { seq_no, reply_no, seq_cst, data } = entry {
-                    self.pre_recv_seq_no = next_seq_no;
+                    self.next_recv_seq_no = next_seq_no.wrapping_add(1);
+                    let do_pump = self.fast_forward();
                     self.concurrent_replies[self.concurrent_replies_total] = seq_no;
                     self.concurrent_replies_total += 1;
                     if seq_cst {
                         debug_assert!(!self.is_locked);
                         self.is_locked = true;
                     }
-                    return Ok(if let Some(send_data) = reply_no.and_then(|r| self.take_send(r)) {
+                    let ret = if let Some(send_data) = reply_no.and_then(|r| self.take_send(r)) {
                         RecvOkRaw::Reply { reply_no: seq_no, seq_cst, recv_data: data, send_data }
                     } else {
                         RecvOkRaw::Payload { reply_no: seq_no, seq_cst, recv_data: data }
-                    });
+                    };
+                    return Ok((ret, do_pump));
                 } else {
                     unreachable!();
                 }
             } else {
-                return Err(PumpError::WaitingForReply);
+                return Err(TryError::WaitingForReply);
             }
         }
-        Err(PumpError::WaitingForRecv)
+        Err(TryError::WaitingForRecv)
     }
     /// This function must be passed a reply number given by `receive_raw` or `pump_raw`, otherwise
     /// it will do nothing. This reply number can only be used to reply once.
@@ -566,9 +586,7 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
                 data: packet_data,
             });
 
-            let mut p = Reply(entry.seq_no, reply_no, &entry.data);
-            p.set_seq_cst(seq_cst);
-            Some(p)
+            Some(entry.to_packet())
         } else {
             None
         }
@@ -590,22 +608,19 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
     /// Can mutate `next_service_timestamp`.
     pub fn service_direct(&mut self, current_time: i64, iter: &mut Option<ServiceIter>) -> Option<Packet<&SendData>> {
         if self.next_service_timestamp <= current_time {
-            let iter = iter.get_or_insert(ServiceIter { idx: 0, next_time: i64::MAX });
-            while let Some(entry) = self.send_window.get(iter.idx) {
-                iter.idx += 1;
-                if let Some(entry) = entry {
+            let iter = iter.get_or_insert(ServiceIter {
+                seq_no: self.next_send_seq_no.wrapping_sub(self.send_window.len() as u32),
+                next_time: i64::MAX,
+            });
+            while iter.seq_no != self.next_send_seq_no {
+                let idx = iter.seq_no as usize % self.send_window.len();
+                iter.seq_no = iter.seq_no.wrapping_add(1);
+                if let Some(entry) = &mut self.send_window[idx] {
                     if entry.next_resend_time <= current_time {
-                        let entry = self.send_window[iter.idx - 1].as_mut().unwrap();
                         entry.next_resend_time = current_time + self.resend_interval;
                         iter.next_time = iter.next_time.min(entry.next_resend_time);
 
-                        let mut p = if let Some(reply_no) = entry.reply_no {
-                            Reply(entry.seq_no, reply_no, &entry.data)
-                        } else {
-                            Payload(entry.seq_no, &entry.data)
-                        };
-                        p.set_seq_cst(entry.seq_cst);
-                        return Some(p);
+                        return Some(self.send_window[idx].as_ref().unwrap().to_packet());
                     } else {
                         iter.next_time = iter.next_time.min(entry.next_resend_time);
                     }

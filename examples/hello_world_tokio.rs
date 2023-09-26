@@ -3,7 +3,7 @@ use std::sync::Arc;
 use tokio::{sync::mpsc, task};
 
 use seq_ex::{
-    tokio::{AsyncRecvError, MpscTransport, ReplyGuard, SeqExTokio},
+    tokio::{MpscTransport, ReplyGuard, SeqExTokio},
     Packet,
 };
 
@@ -17,7 +17,7 @@ enum Payload {
 }
 use Payload::*;
 
-async fn receive(reply_guard: ReplyGuard<'_, &MpscTransport<Payload>, Payload>, payload: Payload) -> Option<()> {
+async fn receive(reply_guard: ReplyGuard<'_, &MpscTransport<Payload>, Payload, Payload>, payload: Payload) -> Option<()> {
     match payload {
         Hello => {
             print!("Hello");
@@ -42,7 +42,7 @@ async fn receive(reply_guard: ReplyGuard<'_, &MpscTransport<Payload>, Payload>, 
     Some(())
 }
 
-async fn say_hello(seq: &SeqExTokio<Payload>, transport: &MpscTransport<Payload>) -> Option<()> {
+async fn say_hello(seq: &SeqExTokio<Payload, Payload>, transport: &MpscTransport<Payload>) -> Option<()> {
     let (reply_guard, payload) = seq.send(transport, false, Hello).await.ok()?;
     if payload != Space {
         return None;
@@ -59,20 +59,8 @@ async fn say_hello(seq: &SeqExTokio<Payload>, transport: &MpscTransport<Payload>
     Some(())
 }
 
-async fn pump_all(peer: Arc<SeqExTokio<Payload>>, transport: MpscTransport<Payload>) {
-    if let Some((g, payload)) = peer.pump(&transport).await {
-        spawn_pump(peer.clone(), transport.clone());
-        receive(g, payload).await;
-    }
-}
-fn spawn_pump(peer: Arc<SeqExTokio<Payload>>, transport: MpscTransport<Payload>) {
-    task::spawn(async move {
-        pump_all(peer, transport).await;
-    });
-}
-
-fn peer_main(transport: MpscTransport<Payload>, mut recv: mpsc::Receiver<Packet<Payload>>) -> Arc<SeqExTokio<Payload>> {
-    let (seq, mut service) = SeqExTokio::<Payload>::new_default();
+fn peer_main(transport: MpscTransport<Payload>, mut recv: mpsc::Receiver<Packet<Payload>>) -> Arc<SeqExTokio<Payload, Payload>> {
+    let (seq, mut service) = SeqExTokio::new_default();
     let peer = Arc::new(seq);
     let peer_weak = Arc::downgrade(&peer);
     let tl = transport.clone();
@@ -87,11 +75,7 @@ fn peer_main(transport: MpscTransport<Payload>, mut recv: mpsc::Receiver<Packet<
             if let Some(peer) = peer_weak.upgrade() {
                 let tl = transport.clone();
                 task::spawn(async move {
-                    let result = peer.receive(&tl, packet);
-                    if matches!(&result, Ok(_) | Err(AsyncRecvError::AsyncReply)) {
-                        spawn_pump(peer.clone(), tl.clone());
-                    }
-                    if let Ok((g, payload)) = result {
+                    if let Ok((g, payload)) = peer.receive(&tl, packet).await {
                         receive(g, payload).await;
                     }
                 });
@@ -112,6 +96,7 @@ async fn main() {
 
     say_hello(&peer1, &transport1).await;
 }
+
 #[test]
 fn test() {
     main()
