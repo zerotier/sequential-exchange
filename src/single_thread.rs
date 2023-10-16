@@ -1,5 +1,5 @@
 use crate::no_std::{RecvOkRaw, SeqEx};
-use crate::result::{RecvError, TryError, TryRecvError};
+use crate::error::{RecvError, TryError, TryRecvError};
 use crate::{Packet, SeqNo, TransportLayer, DEFAULT_WINDOW_CAP};
 
 pub struct ReplyGuard<'a, TL: TransportLayer<SendData>, SendData, RecvData, const CAP: usize = DEFAULT_WINDOW_CAP> {
@@ -150,7 +150,7 @@ impl_recvok!(RecvOk, &'a mut SeqEx<SendData, RecvData, CAP>);
 pub(crate) use impl_recvok;
 
 impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
-    /// Can mutate `next_service_timestamp`.
+    /// Can decrease `next_service_timestamp`.
     pub fn try_send(&mut self, mut tl: impl TransportLayer<SendData>, seq_cst: bool, packet_data: SendData) -> Result<(), (TryError, SendData)> {
         match self.try_send_direct(tl.time(), seq_cst, packet_data) {
             Ok(p) => {
@@ -160,7 +160,7 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
             Err(e) => Err(e),
         }
     }
-    /// Can mutate `next_service_timestamp`.
+    /// Can decrease `next_service_timestamp`.
     pub fn try_send_with<F: FnOnce(SeqNo) -> SendData>(
         &mut self,
         mut tl: impl TransportLayer<SendData>,
@@ -193,7 +193,7 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
             Err(TryRecvError::WaitingForReply) => Err(RecvError::WaitingForReply),
         }
     }
-    /// Can mutate `next_service_timestamp`.
+    /// Can decrease `next_service_timestamp`.
     /// If `unlock` is true and the return value is true pump may return new values.
     ///
     /// Only returns false if the reply number was incorrect or used twice.
@@ -214,7 +214,7 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
             false
         }
     }
-    /// Can mutate `next_service_timestamp`.
+    /// Can increase `next_service_timestamp`.
     pub fn service(&mut self, mut tl: impl TransportLayer<SendData>) -> i64 {
         let current_time = tl.time();
         let mut iter = None;

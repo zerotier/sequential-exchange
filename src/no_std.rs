@@ -1,7 +1,7 @@
 pub use crate::single_thread::*;
 
 use crate::{
-    result::{TryError, TryRecvError},
+    error::{TryError, TryRecvError},
     transport_layer::SeqNo,
     Packet, DEFAULT_INITIAL_SEQ_NO, DEFAULT_RESEND_INTERVAL_MS, DEFAULT_WINDOW_CAP,
 };
@@ -197,14 +197,14 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
     /// user would like. However this choice of units must be consistent with the units of the
     /// `retry_interval`. `current_time` does not have to be monotonically increasing.
     ///
-    /// Can mutate `next_service_timestamp`.
+    /// Can decrease `next_service_timestamp`.
     pub fn try_send_direct(&mut self, current_time: i64, seq_cst: bool, packet_data: SendData) -> Result<Packet<&SendData>, (TryError, SendData)> {
         let mut tmp = Some(packet_data);
         self.try_send_direct_with(current_time, seq_cst, |_| tmp.take().unwrap())
             .map_err(|e| e.0)
             .map_err(|e| (e, tmp.unwrap()))
     }
-    /// Can mutate `next_service_timestamp`.
+    /// Can decrease `next_service_timestamp`.
     pub fn try_send_direct_with<F: FnOnce(SeqNo) -> SendData>(
         &mut self,
         current_time: i64,
@@ -392,7 +392,7 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
     /// and since each fragment will be received in order it will be trivial for them to reconstruct
     /// the original file.
     ///
-    /// Can mutate `next_service_timestamp`.
+    /// Can decrease `next_service_timestamp`.
     /// If `unlock` is true and the return value is `Some` pump may return new values.
     #[must_use]
     pub fn reply_raw_and_direct(
@@ -444,7 +444,8 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
         }
     }
 
-    /// Can mutate `next_service_timestamp`.
+    /// Can increase `next_service_timestamp`.
+    #[inline]
     pub fn service_direct(&mut self, current_time: i64, iter: &mut Option<ServiceIter>) -> Option<Packet<&SendData>> {
         if self.next_service_timestamp <= current_time {
             let iter = iter.get_or_insert(ServiceIter {

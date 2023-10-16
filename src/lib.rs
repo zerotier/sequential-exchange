@@ -38,7 +38,8 @@
 mod transport_layer;
 pub use transport_layer::*;
 
-pub mod result;
+/// Module which contains the various error types that can be returned by SEQEX.
+pub mod error;
 
 /// This module contains the API for using SEQEX in a no-std environment.
 /// This API is low level and is the backbone of the `sync` and `tokio` implementations of SEQEX.
