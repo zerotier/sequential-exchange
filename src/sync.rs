@@ -104,8 +104,8 @@ impl<'a, TL: TransportLayer<SendData>, SendData, RecvData, const CAP: usize> Rep
     /// number the packet reply number. All calls to `TransportLayer::send` involving this packet
     /// will receive the exact same sequence and reply number.
     ///
-    /// Returns the timestamp of when `service_ts` should be called next, only if it has decrease.
-    /// This can be safely ignored if `service_ts` is not being used.
+    /// Returns the timestamp of when `service_scheduled` should be called next, only if it has decrease.
+    /// This can be safely ignored if `service_scheduled` is not being used.
     ///
     /// # Panic
     /// This function will panic if `ack` has been called previously.
@@ -127,8 +127,8 @@ impl<'a, TL: TransportLayer<SendData>, SendData, RecvData, const CAP: usize> Rep
     /// as a reply to the remote peer. Similar to `SeqEx::send`, except the remote peer will be
     /// explicitly informed that this packet is indeed a reply to a packet they sent.
     ///
-    /// Returns the timestamp of when `service_ts` should be called next, only if it has decrease.
-    /// This can be safely ignored if `service_ts` is not being used.
+    /// Returns the timestamp of when `service_scheduled` should be called next, only if it has decrease.
+    /// This can be safely ignored if `service_scheduled` is not being used.
     ///
     /// If you need to reply more than once, say to fragment a large file, then include in your
     /// first reply some identifier, and then `send` all fragments with the same included identifier.
@@ -409,9 +409,9 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
     ///
     /// NOTE: This function can block for a short period of time to lock an internal mutex.
     ///
-    /// A return value of `Ok` contains the timestamp of when `service_ts` should be called next,
-    /// only if it has decrease. This can be safely ignored if `service_ts` is not being used.
-    pub fn try_send_with_ts<TL: TransportLayer<SendData>, F: FnOnce(SeqNo) -> SendData>(
+    /// A return value of `Ok` contains the timestamp of when `service_scheduled` should be called next,
+    /// only if it has decrease. This can be safely ignored if `service_scheduled` is not being used.
+    pub fn try_send_with<TL: TransportLayer<SendData>, F: FnOnce(SeqNo) -> SendData>(
         &self,
         tl: TL,
         seq_cst: bool,
@@ -429,9 +429,9 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
     ///
     /// NOTE: This function can block for a short period of time to lock an internal mutex.
     ///
-    /// A return value of `Ok` contains the timestamp of when `service_ts` should be called next,
-    /// only if it has decrease. This can be safely ignored if `service_ts` is not being used.
-    pub fn try_send_ts<TL: TransportLayer<SendData>>(&self, tl: TL, seq_cst: bool, packet_data: SendData) -> Result<Option<i64>, (TryError, SendData)> {
+    /// A return value of `Ok` contains the timestamp of when `service_scheduled` should be called next,
+    /// only if it has decrease. This can be safely ignored if `service_scheduled` is not being used.
+    pub fn try_send<TL: TransportLayer<SendData>>(&self, tl: TL, seq_cst: bool, packet_data: SendData) -> Result<Option<i64>, (TryError, SendData)> {
         let mut inner = self.inner.lock().unwrap();
         let pre_nst = inner.seq.next_service_timestamp;
         inner.seq.try_send(tl, seq_cst, packet_data).map(|()| {
@@ -447,7 +447,7 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
     /// This function receives the packet sequence number the packet will be assigned.
     /// All calls to `TransportLayer::send` involving this packet will receive this exact same
     /// sequence number.
-    pub fn send_with_ts<TL: TransportLayer<SendData>>(&self, tl: TL, seq_cst: bool, mut packet_data: impl FnOnce(SeqNo) -> SendData) -> Option<i64> {
+    pub fn send_with<TL: TransportLayer<SendData>>(&self, tl: TL, seq_cst: bool, mut packet_data: impl FnOnce(SeqNo) -> SendData) -> Option<i64> {
         let mut inner = self.inner.lock().unwrap();
         let mut pre_nst = inner.seq.next_service_timestamp;
         while let Err((e, p)) = inner.seq.try_send_with(tl, seq_cst, packet_data) {
@@ -482,8 +482,8 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
     /// In-order transport guarantees that all SeqCst payloads are received in the same order that
     /// they were sent.
     ///
-    /// Returns the timestamp of when `service_ts` should be called next, only if it has decrease.
-    /// This can be safely ignored if `service_ts` is not being used.
+    /// Returns the timestamp of when `service_scheduled` should be called next, only if it has decrease.
+    /// This can be safely ignored if `service_scheduled` is not being used.
     pub fn send<TL: TransportLayer<SendData>>(&self, tl: TL, seq_cst: bool, mut packet_data: SendData) -> Option<i64> {
         let mut inner = self.inner.lock().unwrap();
         let mut pre_nst = inner.seq.next_service_timestamp;
@@ -529,7 +529,7 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
     /// that schedule whenever `SeqEx::send`, `ReplyGuard::reply` or any of their variants are called.
     ///
     /// It is recommended to just use `SeqEx::service`.
-    pub fn service_ts(&mut self, mut tl: impl TransportLayer<SendData>) -> i64 {
+    pub fn service_scheduled(&mut self, mut tl: impl TransportLayer<SendData>) -> i64 {
         let mut inner = self.inner.lock().unwrap();
         let current_time = tl.time();
         let mut iter = None;
