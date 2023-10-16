@@ -6,7 +6,7 @@ use tokio::{
 
 use crate::{
     no_std::RecvOkRaw,
-    result::{RecvError, TryError},
+    error::{RecvError, TryError},
     Packet, SeqNo, TransportLayer, DEFAULT_INITIAL_SEQ_NO, DEFAULT_RESEND_INTERVAL_MS, DEFAULT_WINDOW_CAP,
 };
 
