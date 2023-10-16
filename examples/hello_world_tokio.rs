@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use tokio::{sync::mpsc, task};
 
-use seq_ex::{
-    tokio::{MpscTransport, ReplyGuard, SeqExTokio},
+use seqex::{
+    tokio::{MpscTransport, ReplyGuard, SeqEx},
     Packet,
 };
 
@@ -42,7 +42,7 @@ async fn receive(reply_guard: ReplyGuard<'_, &MpscTransport<Payload>, Payload, P
     Some(())
 }
 
-async fn say_hello(seq: &SeqExTokio<Payload, Payload>, transport: &MpscTransport<Payload>) -> Option<()> {
+async fn say_hello(seq: &SeqEx<Payload, Payload>, transport: &MpscTransport<Payload>) -> Option<()> {
     let (reply_guard, payload) = seq.send(transport, false, Hello).await.ok()?;
     if payload != Space {
         return None;
@@ -59,8 +59,8 @@ async fn say_hello(seq: &SeqExTokio<Payload, Payload>, transport: &MpscTransport
     Some(())
 }
 
-fn peer_main(transport: MpscTransport<Payload>, mut recv: mpsc::Receiver<Packet<Payload>>) -> Arc<SeqExTokio<Payload, Payload>> {
-    let (seq, mut service) = SeqExTokio::new_default();
+fn peer_main(transport: MpscTransport<Payload>, mut recv: mpsc::Receiver<Packet<Payload>>) -> Arc<SeqEx<Payload, Payload>> {
+    let (seq, mut service) = SeqEx::new_default();
     let peer = Arc::new(seq);
     let peer_weak = Arc::downgrade(&peer);
     let tl = transport.clone();

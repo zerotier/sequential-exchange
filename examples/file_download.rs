@@ -10,8 +10,8 @@ use std::{
 };
 
 use rand_core::{OsRng, RngCore};
-use seq_ex::{
-    sync::{RecvOk, SeqExSync},
+use seqex::{
+    sync::{RecvOk, SeqEx},
     Packet, TransportLayer,
 };
 use serde::{Deserialize, Serialize};
@@ -32,7 +32,7 @@ struct Transport {
 struct Peer {
     filesystem: Arc<RwLock<HashMap<String, Vec<u8>>>>,
     transport: Transport,
-    seqex: Arc<SeqExSync<Payload, Payload>>,
+    seqex: Arc<SeqEx<Payload, Payload>>,
     receiver: Receiver<Vec<u8>>,
 }
 
@@ -130,13 +130,13 @@ fn main() {
 
     let peer1 = Peer {
         filesystem: Arc::new(RwLock::new(HashMap::new())),
-        seqex: Arc::new(SeqExSync::new(5, 1)),
+        seqex: Arc::new(SeqEx::new(5, 1)),
         transport: Transport { time: Instant::now(), sender: send1 },
         receiver: recv1,
     };
     let peer2 = Peer {
         filesystem: Arc::new(RwLock::new(filesystem2)),
-        seqex: Arc::new(SeqExSync::new(5, 1)),
+        seqex: Arc::new(SeqEx::new(5, 1)),
         transport: Transport { time: Instant::now(), sender: send2 },
         receiver: recv2,
     };
