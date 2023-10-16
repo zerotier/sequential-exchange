@@ -1,50 +1,11 @@
-//! The reference implementation of the **Sequential Exchange Protocol**, or SEP.
-//!
-//! SEP is a peer-to-peer transport protocol that guarantees packets of data will always be received
-//! in the same order they were sent. In addition, it also guarantees the sequential consistency of
-//! stateful exchanges between the two communicating peers.
-//!
-//! A "stateful exchange" is defined here as a sequence of packets, where the first packet
-//! initiates the exchange, and all subsequent packets are replies to the previous packet in the
-//! exchange.
-//!
-//! SEP guarantees both peers will agree upon which packets are members of which exchanges,
-//! and it guarantees each packet is received by each peer in sequential order.
-//!
-//! SEP is a tiny, dead simple protocol and we have implemented it here in less than 500 lines of code.
-//!
-//! ## Why not TCP?
-//!
-//! TCP only guarantees packets will be received in the same order they were sent.
-//! It has no inherent concept of "replying to a packet" and as such it cannot guarantee both sides
-//! of a conversation have the same view of any stateful exchanges that take place.
-//!
-//! TCP is also much higher overhead. It requires a 1.5 RTT handshake to begin any connection,
-//! it has a larger amount of metadata that must be transported with packets, and it has quite a few
-//! features that slow down runtime regardless of whether or not they are used.
-//! A lot of this overhead owes to TCPs sizeable complexity.
-//!
-//! That being said SEP does lack many of TCP's additional features, such as a dynamic resend timer,
-//! keep-alives, and fragmentation. This can be both a pro and a con, as it means there is a
-//! lot of efficiency to be gained if these features are not needed or are implemented at a
-//! different protocol layer.
-//!
-//! Neither SEP nor TCP are cryptographically secure.
-//!
-//! ## Examples
-//!
+pub use crate::single_thread::*;
 
-/// A 32-bit sequence number. Packets transported with SEP are expected to contain at least one
-/// sequence number, and sometimes two.
-/// All packets will either have a seq_no, a reply_no, or both.
-pub type SeqNo = u32;
-
-/// The resend interval for a default instance of SeqEx.
-pub const DEFAULT_RESEND_INTERVAL_MS: i64 = 250;
-/// The initial sequence number for a default instance of SeqEx.
-pub const DEFAULT_INITIAL_SEQ_NO: SeqNo = 0;
-
-pub const DEFAULT_WINDOW_CAP: usize = 64;
+use crate::{
+    result::{TryError, TryRecvError},
+    transport_layer::SeqNo,
+    Packet, DEFAULT_INITIAL_SEQ_NO, DEFAULT_RESEND_INTERVAL_MS, DEFAULT_WINDOW_CAP,
+};
+use Packet::*;
 
 #[derive(Debug)]
 pub struct SeqEx<SendData, RecvData, const CAP: usize = DEFAULT_WINDOW_CAP> {
@@ -100,128 +61,6 @@ impl<SendData> SendEntry<SendData> {
         };
         p.set_seq_cst(self.seq_cst);
         p
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TryRecvError {
-    DroppedTooEarly,
-    DroppedDuplicate,
-    DroppedDuplicateResendAck(SeqNo),
-    WaitingForRecv,
-    WaitingForReply,
-}
-#[cfg(feature = "std")]
-impl std::fmt::Display for TryRecvError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            TryRecvError::DroppedTooEarly => write!(f, "packet arrived too early"),
-            TryRecvError::DroppedDuplicate => write!(f, "packet was a duplicate"),
-            TryRecvError::DroppedDuplicateResendAck(_) => write!(f, "packet was a duplicate, resending ack"),
-            TryRecvError::WaitingForRecv => write!(f, "can't process until another packet is received"),
-            TryRecvError::WaitingForReply => write!(f, "can't process until a reply is finished"),
-        }
-    }
-}
-#[cfg(feature = "std")]
-impl std::error::Error for TryRecvError {}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TryError {
-    WaitingForRecv,
-    WaitingForReply,
-}
-#[cfg(feature = "std")]
-impl std::fmt::Display for TryError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            TryError::WaitingForRecv => write!(f, "can't process until another packet is received"),
-            TryError::WaitingForReply => write!(f, "can't process until a reply is finished"),
-        }
-    }
-}
-#[cfg(feature = "std")]
-impl std::error::Error for TryError {}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub enum Packet<RecvData> {
-    Payload(SeqNo, RecvData),
-    SeqCstPayload(SeqNo, RecvData),
-    Reply(SeqNo, SeqNo, RecvData),
-    SeqCstReply(SeqNo, SeqNo, RecvData),
-    Ack(SeqNo),
-}
-use Packet::*;
-impl<RecvData> Packet<RecvData> {
-    pub fn new_with_data(seq_no: SeqNo, reply_no: Option<SeqNo>, seq_cst: bool, data: RecvData) -> Self {
-        Self::new(Some(seq_no), reply_no, seq_cst, Some(data)).unwrap()
-    }
-    pub fn new(seq_no: Option<SeqNo>, reply_no: Option<SeqNo>, seq_cst: bool, data: Option<RecvData>) -> Option<Self> {
-        match (seq_no, reply_no, seq_cst, data) {
-            (Some(s), None, false, Some(d)) => Some(Payload(s, d)),
-            (Some(s), None, true, Some(d)) => Some(SeqCstPayload(s, d)),
-            (Some(s), Some(r), false, Some(d)) => Some(Reply(s, r, d)),
-            (Some(s), Some(r), true, Some(d)) => Some(SeqCstReply(s, r, d)),
-            (None, Some(r), false, None) => Some(Ack(r)),
-            _ => None,
-        }
-    }
-    pub fn as_ref(&self) -> Packet<&RecvData> {
-        match self {
-            Payload(seq_no, data) => Payload(*seq_no, data),
-            SeqCstPayload(seq_no, data) => SeqCstPayload(*seq_no, data),
-            Reply(seq_no, reply_no, data) => Reply(*seq_no, *reply_no, data),
-            SeqCstReply(seq_no, reply_no, data) => SeqCstReply(*seq_no, *reply_no, data),
-            Ack(reply_no) => Ack(*reply_no),
-        }
-    }
-    pub fn map<SendData>(self, f: impl FnOnce(RecvData) -> SendData) -> Packet<SendData> {
-        match self {
-            Payload(seq_no, data) => Payload(seq_no, f(data)),
-            SeqCstPayload(seq_no, data) => SeqCstPayload(seq_no, f(data)),
-            Reply(seq_no, reply_no, data) => Reply(seq_no, reply_no, f(data)),
-            SeqCstReply(seq_no, reply_no, data) => SeqCstReply(seq_no, reply_no, f(data)),
-            Ack(reply_no) => Ack(reply_no),
-        }
-    }
-    pub fn payload(self) -> Option<RecvData> {
-        self.consume().ok()
-    }
-    pub fn consume(self) -> Result<RecvData, SeqNo> {
-        match self {
-            Payload(_, data) | SeqCstPayload(_, data) | Reply(_, _, data) | SeqCstReply(_, _, data) => Ok(data),
-            Ack(r) => Err(r),
-        }
-    }
-    pub fn is_seq_cst(&self) -> bool {
-        matches!(self, SeqCstPayload(..) | SeqCstReply(..))
-    }
-    pub fn set_seq_cst(&mut self, seq_cst: bool) {
-        let mut tmp = Ack(0);
-        core::mem::swap(&mut tmp, self);
-        match tmp {
-            Payload(seq_no, data) | SeqCstPayload(seq_no, data) => {
-                *self = if seq_cst {
-                    SeqCstPayload(seq_no, data)
-                } else {
-                    Payload(seq_no, data)
-                }
-            }
-            Reply(seq_no, reply_no, data) | SeqCstReply(seq_no, reply_no, data) => {
-                *self = if seq_cst {
-                    SeqCstReply(seq_no, reply_no, data)
-                } else {
-                    Reply(seq_no, reply_no, data)
-                }
-            }
-            Ack(reply_no) => *self = Ack(reply_no),
-        }
-    }
-}
-impl<RecvData: Clone> Packet<&RecvData> {
-    pub fn cloned(&self) -> Packet<RecvData> {
-        self.map(|d| d.clone())
     }
 }
 

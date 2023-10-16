@@ -1,16 +1,16 @@
 [package]
 name = "seq-ex"
-version = "0.1.0"
+version = "1.0.0"
 authors = ["Monica Moniot"]
 edition = "2021"
 
 [lib]
-name = "seq_ex"
+name = "seqex"
 path = "src/lib.rs"
 doc = true
 
 [features]
-default = ["serde", "tokio"]
+default = ["serde", "std"]
 tokio = ["std", "dep:tokio"]
 std = []
 
@@ -22,3 +22,20 @@ tokio = { version = "1.31.0", default-features = false, features = ["sync", "tim
 rand_core = { version = "0.6.4", features = ["getrandom"]}
 serde_cbor = { version = "0.11.2" }
 tokio = { version = "1.31.0", default-features = false, features = ["full"] }
+
+[[example]]
+name = "hello_world"
+path = "examples/hello_world.rs"
+
+[[example]]
+name = "hello_world_tokio"
+path = "examples/hello_world_tokio.rs"
+required-features = ["tokio"]
+
+[[example]]
+name = "calculator"
+path = "examples/calculator.rs"
+
+[[example]]
+name = "file_download"
+path = "examples/file_download.rs"

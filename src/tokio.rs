@@ -5,13 +5,15 @@ use tokio::{
 };
 
 use crate::{
-    Packet, RecvError, RecvOkRaw, SeqEx, SeqNo, TransportLayer, TryError, DEFAULT_INITIAL_SEQ_NO, DEFAULT_RESEND_INTERVAL_MS, DEFAULT_WINDOW_CAP,
+    no_std::RecvOkRaw,
+    result::{RecvError, TryError},
+    Packet, SeqNo, TransportLayer, DEFAULT_INITIAL_SEQ_NO, DEFAULT_RESEND_INTERVAL_MS, DEFAULT_WINDOW_CAP,
 };
 
 type Sender<SendData, RecvData> = (oneshot::Sender<Option<(SeqNo, bool, RecvData)>>, SendData);
 type Receiver<RecvData> = (oneshot::Sender<(SeqNo, bool, RecvData)>, RecvData);
 
-pub struct SeqExTokio<SendData, RecvData, const CAP: usize = DEFAULT_WINDOW_CAP> {
+pub struct SeqEx<SendData, RecvData, const CAP: usize = DEFAULT_WINDOW_CAP> {
     inner: Mutex<SeqExInner<SendData, RecvData, CAP>>,
     wait_on_recv: Notify,
     wait_on_reply: Notify,
@@ -19,38 +21,50 @@ pub struct SeqExTokio<SendData, RecvData, const CAP: usize = DEFAULT_WINDOW_CAP>
 }
 
 struct SeqExInner<SendData, RecvData, const CAP: usize> {
-    seq: SeqEx<Sender<SendData, RecvData>, Receiver<RecvData>, CAP>,
+    seq: crate::no_std::SeqEx<Sender<SendData, RecvData>, Receiver<RecvData>, CAP>,
     recv_waiters: usize,
     reply_waiters: bool,
 }
 
 pub struct ReplyGuard<'a, TL: TokioLayer<SendData = SendData>, SendData, RecvData, const CAP: usize = DEFAULT_WINDOW_CAP> {
-    seq: &'a SeqExTokio<SendData, RecvData, CAP>,
-    app: Option<TL>,
+    seq: &'a SeqEx<SendData, RecvData, CAP>,
+    tl: TL,
     reply_no: SeqNo,
     is_holding_lock: bool,
+    has_replied: bool,
 }
 impl<'a, TL: TokioLayer<SendData = SendData>, SendData, RecvData, const CAP: usize> ReplyGuard<'a, TL, SendData, RecvData, CAP> {
-    fn new(seq: &'a SeqExTokio<SendData, RecvData, CAP>, app: TL, reply_no: SeqNo, is_holding_lock: bool) -> Self {
-        ReplyGuard { seq, app: Some(app), reply_no, is_holding_lock }
+    pub fn get_tl(&self) -> &TL {
+        &self.tl
     }
-    fn try_reply_with_inner(&mut self, app: TL, seq_cst: bool, packet_data: impl FnOnce(SeqNo, SeqNo) -> Sender<SendData, RecvData>) -> Option<i64> {
+    pub fn get_tl_mut(&mut self) -> &mut TL {
+        &mut self.tl
+    }
+    pub fn has_replied(&self) -> bool {
+        self.has_replied
+    }
+    pub fn is_seq_cst(&self) -> bool {
+        self.is_holding_lock
+    }
+
+    fn try_reply_with_inner(&mut self, tl: TL, seq_cst: bool, packet_data: impl FnOnce(SeqNo, SeqNo) -> Sender<SendData, RecvData>) -> Option<i64> {
         let mut inner = self.seq.inner.lock().unwrap();
         let seq_no = inner.seq.seq_no();
 
         let pre_ts = inner.seq.next_service_timestamp;
         inner
             .seq
-            .reply_raw(app, self.reply_no, self.is_holding_lock, seq_cst, packet_data(seq_no, self.reply_no));
+            .reply_raw(tl, self.reply_no, self.is_holding_lock, seq_cst, packet_data(seq_no, self.reply_no));
         let ret = (pre_ts != inner.seq.next_service_timestamp).then_some(inner.seq.next_service_timestamp);
 
         self.seq.notify_reply(inner);
         ret
     }
     pub fn ack(&mut self) {
-        if let Some(app) = self.app.take() {
+        if !self.has_replied {
+            self.has_replied = true;
             let mut inner = self.seq.inner.lock().unwrap();
-            inner.seq.ack_raw(app, self.reply_no, self.is_holding_lock);
+            inner.seq.ack_raw(self.tl, self.reply_no, self.is_holding_lock);
         }
     }
     /// If you need to reply more than once, say to fragment a large file, then include in your
@@ -70,34 +84,40 @@ impl<'a, TL: TokioLayer<SendData = SendData>, SendData, RecvData, const CAP: usi
         seq_cst: bool,
         packet_data: impl FnOnce(SeqNo, SeqNo) -> SendData,
     ) -> Result<(ReplyGuard<'a, TL, SendData, RecvData, CAP>, RecvData), AsyncError> {
-        let app = self.app.take().expect("Cannot reply after an ack has been sent");
+        assert!(!self.has_replied, "Cannot reply after an ack has been sent");
+        self.has_replied = true;
+        let tl = self.tl;
+        let seq = self.seq;
         let (tx, rx) = oneshot::channel();
 
-        let update_ts = self.try_reply_with_inner(app.clone(), seq_cst, |s, r| (tx, packet_data(s, r)));
-        let seq = self.seq;
+        let update_ts = self.try_reply_with_inner(tl, seq_cst, |s, r| (tx, packet_data(s, r)));
         core::mem::forget(self);
 
         if let Some(update_ts) = update_ts {
             let _ = seq.update_queue.send(update_ts).await;
         }
         let (reply_no, seq_cst, recv_data) = rx.await.map_err(|_| AsyncError::SeqExClosed)?.ok_or(AsyncError::EndOfExchange)?;
-        Ok((Self::new(seq, app, reply_no, seq_cst), recv_data))
+        Ok((Self::new(seq, tl, reply_no, seq_cst), recv_data))
     }
 
-    pub fn to_components(self) -> (SeqNo, bool) {
+    pub unsafe fn to_components(self) -> (SeqNo, bool) {
         let ret = (self.reply_no, self.is_holding_lock);
         core::mem::forget(self);
         ret
     }
-    pub unsafe fn from_components(seq: &'a SeqExTokio<SendData, RecvData, CAP>, app: TL, reply_no: SeqNo, is_holding_lock: bool) -> Self {
-        Self::new(seq, app, reply_no, is_holding_lock)
+    fn new(seq: &'a SeqEx<SendData, RecvData, CAP>, tl: TL, reply_no: SeqNo, is_holding_lock: bool) -> Self {
+        ReplyGuard { seq, tl, reply_no, is_holding_lock, has_replied: false }
+    }
+    pub unsafe fn from_components(seq: &'a SeqEx<SendData, RecvData, CAP>, tl: TL, reply_no: SeqNo, is_holding_lock: bool) -> Self {
+        Self::new(seq, tl, reply_no, is_holding_lock)
     }
 }
 impl<'a, TL: TokioLayer<SendData = SendData>, SendData, RecvData, const CAP: usize> Drop for ReplyGuard<'a, TL, SendData, RecvData, CAP> {
     fn drop(&mut self) {
         let mut inner = self.seq.inner.lock().unwrap();
-        if let Some(app) = self.app.take() {
-            inner.seq.ack_raw(app, self.reply_no, self.is_holding_lock);
+        if !self.has_replied {
+            self.has_replied = true;
+            inner.seq.ack_raw(self.tl, self.reply_no, self.is_holding_lock);
         }
         self.seq.notify_reply(inner);
     }
@@ -159,13 +179,13 @@ impl<'a, RecvData> From<IntoOneshot<'a, RecvData>> for Receiver<RecvData> {
     }
 }
 
-impl<SendData, RecvData, const CAP: usize> SeqExTokio<SendData, RecvData, CAP> {
+impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
     pub fn new(retry_interval: i64, initial_seq_no: SeqNo) -> (Self, ServiceState) {
         let (update_queue, recv_service_update) = mpsc::channel(8);
         (
             Self {
                 inner: Mutex::new(SeqExInner {
-                    seq: SeqEx::new(retry_interval, initial_seq_no),
+                    seq: crate::no_std::SeqEx::new(retry_interval, initial_seq_no),
                     recv_waiters: 0,
                     reply_waiters: false,
                 }),
@@ -189,11 +209,11 @@ impl<SendData, RecvData, const CAP: usize> SeqExTokio<SendData, RecvData, CAP> {
     }
     fn receive_inner<TL: TokioLayer<SendData = SendData>>(
         &self,
-        app: TL,
+        tl: TL,
         packet: Packet<IntoOneshot<'_, RecvData>>,
     ) -> Result<(ReplyGuard<'_, TL, SendData, RecvData, CAP>, RecvData), Option<AsyncRecvError>> {
         let mut inner = self.inner.lock().unwrap();
-        return match inner.seq.receive_raw(app.clone(), packet) {
+        return match inner.seq.receive_raw(tl, packet) {
             Ok((recv_data, do_pump)) => {
                 // pump first, handle return value second.
                 let mut total_recv = 1;
@@ -205,12 +225,12 @@ impl<SendData, RecvData, const CAP: usize> SeqExTokio<SendData, RecvData, CAP> {
                                 if recv_data.0.send((reply_no, seq_cst, recv_data.1)).is_err() {
                                     // Send an ack if no one is receiving the reply on the other end.
                                     // Could occur if the future holding the receiver is dropped.
-                                    inner.seq.ack_raw(app.clone(), reply_no, seq_cst);
+                                    inner.seq.ack_raw(tl, reply_no, seq_cst);
                                 }
                             }
                             RecvOkRaw::Reply { reply_no, seq_cst, recv_data, send_data } => {
                                 if send_data.0.send(Some((reply_no, seq_cst, recv_data.1))).is_err() {
-                                    inner.seq.ack_raw(app.clone(), reply_no, seq_cst);
+                                    inner.seq.ack_raw(tl, reply_no, seq_cst);
                                 }
                             }
                             RecvOkRaw::Ack { send_data: (tx, _) } => {
@@ -224,12 +244,12 @@ impl<SendData, RecvData, const CAP: usize> SeqExTokio<SendData, RecvData, CAP> {
                 }
 
                 let ret = match recv_data {
-                    RecvOkRaw::Payload { reply_no, seq_cst, recv_data } => Ok((ReplyGuard::new(self, app, reply_no, seq_cst), recv_data.0)),
+                    RecvOkRaw::Payload { reply_no, seq_cst, recv_data } => Ok((ReplyGuard::new(self, tl, reply_no, seq_cst), recv_data.0)),
                     RecvOkRaw::Reply { reply_no, seq_cst, recv_data, send_data: (tx, _) } => {
                         if tx.send(Some((reply_no, seq_cst, recv_data.0))).is_err() {
                             // Send an ack if no one is receiving the reply on the other end.
                             // Could occur if the future holding the receiver is dropped.
-                            inner.seq.ack_raw(app, reply_no, seq_cst);
+                            inner.seq.ack_raw(tl, reply_no, seq_cst);
                         }
                         Err(Some(AsyncRecvError::AsyncReply))
                     }
@@ -256,18 +276,18 @@ impl<SendData, RecvData, const CAP: usize> SeqExTokio<SendData, RecvData, CAP> {
 
     pub async fn receive<TL: TokioLayer<SendData = SendData>>(
         &self,
-        app: TL,
+        tl: TL,
         packet: Packet<RecvData>,
     ) -> Result<(ReplyGuard<'_, TL, SendData, RecvData, CAP>, RecvData), AsyncRecvError> {
         let mut tx = None;
         let packet = packet.map(|r| IntoOneshot(r, &mut tx));
-        match self.receive_inner(app.clone(), packet) {
+        match self.receive_inner(tl, packet) {
             Ok(ret) => Ok(ret),
             Err(Some(e)) => Err(e),
             Err(None) => {
                 if let Some(tx) = tx {
                     let (reply_no, is_holding_lock, data) = tx.await.map_err(|_| AsyncRecvError::SeqExClosed)?;
-                    Ok((ReplyGuard::new(self, app, reply_no, is_holding_lock), data))
+                    Ok((ReplyGuard::new(self, tl, reply_no, is_holding_lock), data))
                 } else {
                     Err(AsyncRecvError::DroppedDuplicate)
                 }
@@ -277,13 +297,13 @@ impl<SendData, RecvData, const CAP: usize> SeqExTokio<SendData, RecvData, CAP> {
 
     fn send_with_inner<TL: TokioLayer<SendData = SendData>, F: FnOnce(SeqNo) -> Sender<SendData, RecvData>>(
         &self,
-        app: TL,
+        tl: TL,
         seq_cst: bool,
         packet_data: F,
     ) -> Result<Option<i64>, (TryError, F)> {
         let mut inner = self.inner.lock().unwrap();
         let pre_ts = inner.seq.next_service_timestamp;
-        let result = inner.seq.try_send_with(app, seq_cst, packet_data);
+        let result = inner.seq.try_send_with(tl, seq_cst, packet_data);
         match result {
             Err((TryError::WaitingForRecv, p)) => {
                 inner.recv_waiters += 1;
@@ -299,28 +319,28 @@ impl<SendData, RecvData, const CAP: usize> SeqExTokio<SendData, RecvData, CAP> {
 
     pub async fn send<TL: TokioLayer<SendData = SendData>>(
         &self,
-        app: TL,
+        tl: TL,
         seq_cst: bool,
         packet_data: SendData,
     ) -> Result<(ReplyGuard<'_, TL, SendData, RecvData, CAP>, RecvData), AsyncError> {
-        self.send_with(app, seq_cst, |_| packet_data).await
+        self.send_with(tl, seq_cst, |_| packet_data).await
     }
     pub async fn send_with<TL: TokioLayer<SendData = SendData>>(
         &self,
-        app: TL,
+        tl: TL,
         seq_cst: bool,
         packet_data: impl FnOnce(SeqNo) -> SendData,
     ) -> Result<(ReplyGuard<'_, TL, SendData, RecvData, CAP>, RecvData), AsyncError> {
         let (rx, tx) = oneshot::channel();
         let mut pf = |s| (rx, packet_data(s));
         loop {
-            match self.send_with_inner(app.clone(), seq_cst, pf) {
+            match self.send_with_inner(tl, seq_cst, pf) {
                 Ok(update) => {
                     if let Some(update) = update {
                         let _ = self.update_queue.send(update).await;
                     }
                     let (reply_no, locked, recv_data) = tx.await.map_err(|_| AsyncError::SeqExClosed)?.ok_or(AsyncError::EndOfExchange)?;
-                    return Ok((ReplyGuard::new(self, app, reply_no, locked), recv_data));
+                    return Ok((ReplyGuard::new(self, tl, reply_no, locked), recv_data));
                 }
                 Err((TryError::WaitingForRecv, p)) => {
                     pf = p;
@@ -336,10 +356,10 @@ impl<SendData, RecvData, const CAP: usize> SeqExTokio<SendData, RecvData, CAP> {
 
     /// This function must be called with the same ServiceState instance returned upon creation of
     /// the given SeqExTokio instance.
-    pub async fn service_task<TL: TokioLayer<SendData = SendData>>(&self, mut app: TL, state: &mut ServiceState) {
+    pub async fn service_task<TL: TokioLayer<SendData = SendData>>(&self, mut tl: TL, state: &mut ServiceState) {
         let mut result = None;
         if state.next_service_timestamp < i64::MAX {
-            let diff = state.next_service_timestamp - app.time();
+            let diff = state.next_service_timestamp - tl.time();
             if diff > 0 {
                 if let Ok(up) = time::timeout(time::Duration::from_millis(diff as u64), state.recv_service_update.recv()).await {
                     result = up
@@ -353,13 +373,13 @@ impl<SendData, RecvData, const CAP: usize> SeqExTokio<SendData, RecvData, CAP> {
             state.next_service_timestamp = state.next_service_timestamp.min(up);
         } else {
             let mut inner = self.inner.lock().unwrap();
-            inner.seq.service(app.clone());
+            inner.seq.service(tl);
             state.next_service_timestamp = inner.seq.next_service_timestamp;
         }
     }
 }
 
-pub trait TokioLayer: Clone {
+pub trait TokioLayer: Clone + Copy {
     type SendData;
 
     fn time(&mut self) -> i64;
