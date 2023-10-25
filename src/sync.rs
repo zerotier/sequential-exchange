@@ -7,8 +7,8 @@ use std::{
 };
 
 use crate::{
-    no_std::RecvOkRaw,
     error::{RecvError, TryError},
+    no_std::RecvOkRaw,
     Packet, SeqNo, TransportLayer, DEFAULT_INITIAL_SEQ_NO, DEFAULT_RESEND_INTERVAL_MS, DEFAULT_WINDOW_CAP,
 };
 
@@ -45,57 +45,48 @@ struct SeqExInner<SendData, RecvData, const CAP: usize> {
 /// protocol are maintained.
 ///
 /// Every time a data-containing packet is received by SEQEX, it must be replied to by either an ack,
-/// or a reply pacjet, but never both. This guard is created when data-containing packet is received,
+/// or a reply packet, but never both. This guard is created when data-containing packet is received,
 /// and when it is dropped it will send an ack. However this guard contains the function `reply`.
 /// This function consumes the guard and will cause a reply packet to be sent instead of an ack.
 ///
-/// In addition, if the data-containing packet was also a SeqCst packet. This guard acts like a
-/// `MutexGuard`. All other received SeqCst packets will be blocked until this guard is dropped or
-/// consumed.
+/// In addition, if the data-containing packet was also a SeqCst packet, then this guard will act
+/// like a `MutexGuard`. All other received SeqCst packets will be blocked until this guard is
+/// dropped.
+/// This creates a critical section for SeqCst packets that guarantees they are processed in the
+/// exact same order they were sent.
 ///
 /// SeqCst packets almost always require a critical section to be processed correctly, otherwise
 /// their in-order guarantee would be rendered pointless because of CPU scheduling non-determinism.
-/// Reply guard make sure these critical sections are exist by default.
 pub struct ReplyGuard<'a, TL: TransportLayer<SendData>, SendData, RecvData, const CAP: usize = DEFAULT_WINDOW_CAP> {
     seq: &'a SeqEx<SendData, RecvData, CAP>,
     tl: TL,
     reply_no: SeqNo,
     is_holding_lock: bool,
-    has_replied: bool,
 }
+
+/// A lock guard for maintaining the critical section for processing SeqCst packets. SeqCst packets
+/// can only enter this critical section in the order they were sent by the remote peer.
+pub struct SeqCstGuard<'a, SendData, RecvData, const CAP: usize = DEFAULT_WINDOW_CAP> {
+    seq: &'a SeqEx<SendData, RecvData, CAP>,
+}
+
 impl<'a, TL: TransportLayer<SendData>, SendData, RecvData, const CAP: usize> ReplyGuard<'a, TL, SendData, RecvData, CAP> {
     /// Returns a reference to the `TransportLayer` instance this guard was created with.
     pub fn get_tl(&self) -> &TL {
         &self.tl
     }
     /// Returns a mutable reference to the `TransportLayer` instance this guard was created with.
-    ///
-    /// Keep in mind that this cannot be used to change how replies and acks are resent, since
-    /// resends are handled with a separate instance of `TransportLayer` passed to `SeqEx::service`.
     pub fn get_tl_mut(&mut self) -> &mut TL {
         &mut self.tl
     }
-    /// Returns whether or not `ack` has already been called on this reply guard instance.
-    pub fn has_replied(&self) -> bool {
-        self.has_replied
-    }
-    /// Returns whether or nor this reply guard is for a SeqCst packet, and therefore is
-    /// holding a lock, preventing other SeqCst packets from being processed yet.
+    /// Returns whether or nor this reply guard is currently holding the SeqCst lock,
+    /// preventing other SeqCst packets from being processed.
+    ///
+    /// When this returns `true`, it means the current thread is within the critical section for
+    /// processing SeqCst packets. SeqCst packets can only enter this critical section in the same
+    /// order they were sent.
     pub fn is_seq_cst(&self) -> bool {
         self.is_holding_lock
-    }
-    /// Cause this reply guard to immediately send an ack to the remote peer,
-    /// preventing it from being used to send a reply.
-    ///
-    /// This allows advanced users to decouple locking the critical section for SeqCst packets
-    /// from sending acks to received packets. It is not recommended to use this function
-    /// except for this purpose. `drop` this reply guard instead.
-    pub fn ack(&mut self) {
-        if !self.has_replied {
-            self.has_replied = true;
-            let mut inner = self.seq.inner.lock().unwrap();
-            inner.seq.ack_raw(self.tl, self.reply_no, self.is_holding_lock);
-        }
     }
     /// Similar to `ReplyGuard::reply`, except the provided function is called to produce the data
     /// to write to the send window.
@@ -106,12 +97,7 @@ impl<'a, TL: TransportLayer<SendData>, SendData, RecvData, const CAP: usize> Rep
     ///
     /// Returns the timestamp of when `service_scheduled` should be called next, only if it has decrease.
     /// This can be safely ignored if `service_scheduled` is not being used.
-    ///
-    /// # Panic
-    /// This function will panic if `ack` has been called previously.
-    pub fn reply_with(mut self, seq_cst: bool, packet_data: impl FnOnce(SeqNo, SeqNo) -> SendData) -> Option<i64> {
-        assert!(!self.has_replied, "Cannot reply after an ack has been sent");
-        self.has_replied = true;
+    pub fn reply_with(self, seq_cst: bool, packet_data: impl FnOnce(SeqNo, SeqNo) -> SendData) -> Option<i64> {
         let mut inner = self.seq.inner.lock().unwrap();
         let pre_nst = inner.seq.next_service_timestamp;
         let seq_no = inner.seq.seq_no();
@@ -135,44 +121,138 @@ impl<'a, TL: TransportLayer<SendData>, SendData, RecvData, const CAP: usize> Rep
     /// The identifier will tell the remote peer which packets contain fragments of the file,
     /// and since each fragment will be received in order it will be trivial for them to reconstruct
     /// the original file.
-    ///
-    /// # Panic
-    /// This function will panic if `ack` has been called previously.
     pub fn reply(self, seq_cst: bool, packet_data: SendData) -> Option<i64> {
         self.reply_with(seq_cst, |_, _| packet_data)
+    }
+
+    fn consume_lock(self, inner: MutexGuard<'a, SeqExInner<SendData, RecvData, CAP>>) -> Option<SeqCstGuard<'a, SendData, RecvData, CAP>> {
+        let ret = if self.is_holding_lock {
+            Some(SeqCstGuard { seq: self.seq })
+        } else {
+            self.seq.notify_reply(inner);
+            None
+        };
+        core::mem::forget(self);
+        ret
+    }
+    /// Cause this reply guard to immediately send an ack to the remote peer,
+    /// consuming it and returning a new guard. This `SeqCstGuard` prevents SeqCst packets from
+    /// being processed by SeqEx until it is dropped.
+    ///
+    /// If this guard was not for a SeqCst packet (or the user called `unlock` previously),
+    /// then it will return `None` instead of a `SeqCstGuard`.
+    ///
+    /// This allows advanced users to de-couple locking the critical section for SeqCst packets
+    /// from sending acks to received packets.
+    /// In cases where the critical section has to be maintained for a long period of time this can
+    /// save bandwidth that would otherwise be wasted on resends.
+    /// It is not recommended to use this function except for this purpose.
+    ///
+    /// Casual users are recommended to simply `drop` this reply guard instead of calling this function.
+    pub fn ack(self) -> Option<SeqCstGuard<'a, SendData, RecvData, CAP>> {
+        let mut inner = self.seq.inner.lock().unwrap();
+        inner.seq.ack_raw(self.tl, self.reply_no, false);
+        self.consume_lock(inner)
+    }
+    /// If this guard is holding the SeqCst lock, and preventing other SeqCst packets from
+    /// being processed, then this function will force it to drop this lock.
+    /// If the next SeqCst packet is waiting in the receive window, then this will unblock a thread
+    /// blocked on `SeqEx::receive` or `SeqEx::pump` to process it.
+    ///
+    /// Returns `true` if this guard was holding the SeqCst lock,
+    /// similar to function `ReplyGuard::is_seq_cst`.
+    ///
+    /// This allows advanced users to de-couple locking the critical section for SeqCst packets
+    /// from sending acks to received packets.
+    /// In cases where a critical section is no longer needed, this function can allow more than one
+    /// thread to process SeqCst packets in parallel, improving performance.
+    /// It is not recommended to use this function except for this purpose.
+    ///
+    /// Casual users are recommended to simply `drop` this reply guard instead of calling this function.
+    pub fn unlock(&mut self) -> bool {
+        if self.is_holding_lock {
+            self.is_holding_lock = false;
+            let mut inner = self.seq.inner.lock().unwrap();
+            inner.seq.unlock_raw();
+            self.seq.notify_reply(inner);
+            true
+        } else {
+            false
+        }
+    }
+    /// Send a reply to the remote peer that was created by the provided function.
+    /// Similar to `ReplyGuard::reply_with`, except this will not drop the SeqCst lock if
+    /// this guard is holding it.
+    ///
+    /// See the documentation for `ReplyGuard::reply_stay_locked` for more information.
+    pub fn reply_with_stay_locked(
+        self,
+        seq_cst: bool,
+        packet_data: impl FnOnce(SeqNo, SeqNo) -> SendData,
+    ) -> (Option<SeqCstGuard<'a, SendData, RecvData, CAP>>, Option<i64>) {
+        let mut inner = self.seq.inner.lock().unwrap();
+        let pre_nst = inner.seq.next_service_timestamp;
+        let seq_no = inner.seq.seq_no();
+        inner
+            .seq
+            .reply_raw(self.tl, self.reply_no, false, seq_cst, packet_data(seq_no, self.reply_no));
+        let nst = inner.seq.next_service_timestamp;
+
+        (self.consume_lock(inner), (pre_nst > nst).then_some(nst))
+    }
+    /// Send a reply to the remote peer, similar to `ReplyGuard::reply`, except without dropping the
+    /// SeqCst lock.
+    ///
+    /// If this guard was holding the SeqCst lock, then it will return a `SeqCstGuard`, which will
+    /// continue to hold the lock until it is dropped. If this guard was not holding the lock, it
+    /// will return `None` instead.
+    ///
+    /// This allows advanced users to de-couple locking the critical section for SeqCst packets
+    /// from sending acks to received packets.
+    /// In cases where the critical section has to be maintained for a long period of time this can
+    /// save bandwidth that would otherwise be wasted on resends.
+    /// It is not recommended to use this function except for this purpose.
+    ///
+    /// Casual users are recommended to use `ReplyGuard::reply` instead of calling this function.
+    ///
+    /// The second return value is again the timestamp of when `service_scheduled` should be called
+    /// next, only if it has decrease.
+    pub fn reply_stay_locked(self, seq_cst: bool, packet_data: SendData) -> (Option<SeqCstGuard<'a, SendData, RecvData, CAP>>, Option<i64>) {
+        self.reply_with_stay_locked(seq_cst, |_, _| packet_data)
     }
     /// Break down a `ReplyGuard` into its primitive components, without causing it to send an ack
     /// or reply to the remote peer.
     ///
     /// The first return value is the packet reply number, and the second is the return value of
-    /// `is_seq_cst`, which states whether or not this `ReplyGuard` is holding a lock.
+    /// `is_seq_cst`, which states whether or not this `ReplyGuard` is holding the SeqCst lock.
     ///
     /// This can be used in combination with `from_components` to move a `ReplyGuard` to a different
     /// thread.
     ///
     /// # Safety
-    /// This function must never be called on a `ReplyGuard` that has had `ack` called on it.
-    ///
     /// The caller must guarantee that `ReplyGuard::from_components` is eventually called on
     /// the returned values.
     ///
-    /// If these invariants are not maintained protocol deadlock is likely to occur, which will quickly
-    /// be followed by lock-based deadlock.
+    /// If this does not happen the SEQEX protocol will enter a deadlocked state,
+    /// which is likely to cause threads to permanently block.
     pub unsafe fn to_components(self) -> (SeqNo, bool) {
-        debug_assert!(!self.has_replied, "Cannot break down a ReplyGuard after an ack has been sent");
         let ret = (self.reply_no, self.is_holding_lock);
         core::mem::forget(self);
         ret
     }
     fn new(seq: &'a SeqEx<SendData, RecvData, CAP>, tl: TL, reply_no: SeqNo, is_holding_lock: bool) -> Self {
-        ReplyGuard { seq, tl, reply_no, is_holding_lock, has_replied: false }
+        ReplyGuard { seq, tl, reply_no, is_holding_lock }
     }
     /// Constructs a `ReplyGuard` object from the raw components returned by
     /// `ReplyGuard::to_components`.
     ///
     /// # Safety
     /// The caller must always pass values for `reply_no` and `is_holding_lock` that were
-    /// returned by `ReplyGuard::to_components`. Otherwise undefined behavior will occur.
+    /// originally returned by consuming a `ReplyGuard` instance with `to_components`.
+    ///
+    /// `seq` must be the exact same instance of `SeqEx` that issued the original `ReplyGuard`.
+    ///
+    /// Otherwise undefined behavior will occur.
     pub unsafe fn from_components(seq: &'a SeqEx<SendData, RecvData, CAP>, tl: TL, reply_no: SeqNo, is_holding_lock: bool) -> Self {
         Self::new(seq, tl, reply_no, is_holding_lock)
     }
@@ -180,10 +260,15 @@ impl<'a, TL: TransportLayer<SendData>, SendData, RecvData, const CAP: usize> Rep
 impl<'a, TL: TransportLayer<SendData>, SendData, RecvData, const CAP: usize> Drop for ReplyGuard<'a, TL, SendData, RecvData, CAP> {
     fn drop(&mut self) {
         let mut inner = self.seq.inner.lock().unwrap();
-        if !self.has_replied {
-            self.has_replied = true;
-            inner.seq.ack_raw(self.tl, self.reply_no, self.is_holding_lock);
-        }
+        inner.seq.ack_raw(self.tl, self.reply_no, self.is_holding_lock);
+        self.seq.notify_reply(inner);
+    }
+}
+impl<'a, SendData, RecvData, const CAP: usize> Drop for SeqCstGuard<'a, SendData, RecvData, CAP> {
+    fn drop(&mut self) {
+        let mut inner = self.seq.inner.lock().unwrap();
+        // It is guaranteed at this point for SeqEx to be locked because it was locked on guard creation.
+        inner.seq.unlock_raw();
         self.seq.notify_reply(inner);
     }
 }
@@ -312,9 +397,16 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
     /// eventually processed with the SEQEX transport guarantees.
     ///
     /// This function may block to preserve lossless or in-order transport.
+    /// In particular this function will block to guarantee SeqCst packets are processed in the same
+    /// order that they were sent. See `ReplyGuard` for more information.
     ///
-    /// If this function returns `Some`, the contained boolean is true if `SeqEx::pump` should also
-    /// be called, because there are packets ready to be processed in the receive window.
+    /// If we are waiting to receive packets from the remote peer, this function will not block
+    /// and instead return `None`.
+    ///
+    /// This function returns an option, where the first contained value is received data that
+    /// the caller can now process, and the second value is a boolean specifying if there is yet
+    /// more received data to be processed. This boolean is true if `SeqEx::pump` should be called,
+    /// because there are more packets ready to be processed in the receive window.
     pub fn receive<TL: TransportLayer<SendData>>(&self, tl: TL, packet: Packet<RecvData>) -> Option<(RecvOk<'_, TL, SendData, RecvData, CAP>, bool)> {
         let result = self.try_receive(tl, packet);
         if let Err(RecvError::WaitingForReply) = result {

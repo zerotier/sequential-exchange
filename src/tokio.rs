@@ -5,8 +5,8 @@ use tokio::{
 };
 
 use crate::{
-    no_std::RecvOkRaw,
     error::{RecvError, TryError},
+    no_std::RecvOkRaw,
     Packet, SeqNo, TransportLayer, DEFAULT_INITIAL_SEQ_NO, DEFAULT_RESEND_INTERVAL_MS, DEFAULT_WINDOW_CAP,
 };
 
@@ -31,18 +31,27 @@ pub struct ReplyGuard<'a, TL: TokioLayer<SendData = SendData>, SendData, RecvDat
     tl: TL,
     reply_no: SeqNo,
     is_holding_lock: bool,
-    has_replied: bool,
 }
+
+pub struct SeqCstGuard<'a, SendData, RecvData, const CAP: usize = DEFAULT_WINDOW_CAP> {
+    seq: &'a SeqEx<SendData, RecvData, CAP>,
+}
+
 impl<'a, TL: TokioLayer<SendData = SendData>, SendData, RecvData, const CAP: usize> ReplyGuard<'a, TL, SendData, RecvData, CAP> {
+    /// Returns a reference to the `TransportLayer` instance this guard was created with.
     pub fn get_tl(&self) -> &TL {
         &self.tl
     }
+    /// Returns a mutable reference to the `TransportLayer` instance this guard was created with.
     pub fn get_tl_mut(&mut self) -> &mut TL {
         &mut self.tl
     }
-    pub fn has_replied(&self) -> bool {
-        self.has_replied
-    }
+    /// Returns whether or nor this reply guard is currently holding the SeqCst lock,
+    /// preventing other SeqCst packets from being processed.
+    ///
+    /// When this returns `true`, it means the current thread is within the critical section for
+    /// processing SeqCst packets. SeqCst packets can only enter this critical section in the same
+    /// order they were sent.
     pub fn is_seq_cst(&self) -> bool {
         self.is_holding_lock
     }
@@ -60,32 +69,19 @@ impl<'a, TL: TokioLayer<SendData = SendData>, SendData, RecvData, const CAP: usi
         self.seq.notify_reply(inner);
         ret
     }
-    pub fn ack(&mut self) {
-        if !self.has_replied {
-            self.has_replied = true;
-            let mut inner = self.seq.inner.lock().unwrap();
-            inner.seq.ack_raw(self.tl, self.reply_no, self.is_holding_lock);
-        }
-    }
     /// If you need to reply more than once, say to fragment a large file, then include in your
     /// first reply some identifier, and then `send` all fragments with the same included identifier.
     /// The identifier will tell the remote peer which packets contain fragments of the file,
     /// and since each fragment will be received in order it will be trivial for them to reconstruct
     /// the original file.
-    /// # Panic
-    /// This function will panic if `ack` has been called.
     pub async fn reply(self, seq_cst: bool, packet_data: SendData) -> Result<(ReplyGuard<'a, TL, SendData, RecvData, CAP>, RecvData), AsyncError> {
         self.reply_with(seq_cst, |_, _| packet_data).await
     }
-    /// # Panic
-    /// This function will panic if `ack` has been called.
     pub async fn reply_with(
         mut self,
         seq_cst: bool,
         packet_data: impl FnOnce(SeqNo, SeqNo) -> SendData,
     ) -> Result<(ReplyGuard<'a, TL, SendData, RecvData, CAP>, RecvData), AsyncError> {
-        assert!(!self.has_replied, "Cannot reply after an ack has been sent");
-        self.has_replied = true;
         let tl = self.tl;
         let seq = self.seq;
         let (tx, rx) = oneshot::channel();
@@ -100,14 +96,95 @@ impl<'a, TL: TokioLayer<SendData = SendData>, SendData, RecvData, const CAP: usi
         Ok((Self::new(seq, tl, reply_no, seq_cst), recv_data))
     }
 
+    fn consume_lock(self, inner: MutexGuard<'a, SeqExInner<SendData, RecvData, CAP>>) -> Option<SeqCstGuard<'a, SendData, RecvData, CAP>> {
+        let ret = if self.is_holding_lock {
+            Some(SeqCstGuard { seq: self.seq })
+        } else {
+            self.seq.notify_reply(inner);
+            None
+        };
+        core::mem::forget(self);
+        ret
+    }
+    /// Cause this reply guard to immediately send an ack to the remote peer,
+    /// consuming it and returning a new guard. This `SeqCstGuard` prevents SeqCst packets from
+    /// being processed by SeqEx until it is dropped.
+    ///
+    /// If this guard was not for a SeqCst packet (or the user called `unlock` previously),
+    /// then it will return `None` instead of a `SeqCstGuard`.
+    ///
+    /// This allows advanced users to de-couple locking the critical section for SeqCst packets
+    /// from sending acks to received packets.
+    /// In cases where the critical section has to be maintained for a long period of time this can
+    /// save bandwidth that would otherwise be wasted on resends.
+    /// It is not recommended to use this function except for this purpose.
+    ///
+    /// Casual users are recommended to simply `drop` this reply guard instead of calling this function.
+    pub fn ack(self) -> Option<SeqCstGuard<'a, SendData, RecvData, CAP>> {
+        let mut inner = self.seq.inner.lock().unwrap();
+        inner.seq.ack_raw(self.tl, self.reply_no, false);
+        self.consume_lock(inner)
+    }
+    /// If this guard is holding the SeqCst lock, and preventing other SeqCst packets from
+    /// being processed, then this function will force it to drop this lock.
+    /// If the next SeqCst packet is waiting in the receive window, then this will unblock a thread
+    /// blocked on `SeqEx::receive` or `SeqEx::pump` to process it.
+    ///
+    /// Returns `true` if this guard was holding the SeqCst lock,
+    /// similar to function `ReplyGuard::is_seq_cst`.
+    ///
+    /// This allows advanced users to de-couple locking the critical section for SeqCst packets
+    /// from sending acks to received packets.
+    /// In cases where a critical section is no longer needed, this function can allow more than one
+    /// thread to process SeqCst packets in parallel, improving performance.
+    /// It is not recommended to use this function except for this purpose.
+    ///
+    /// Casual users are recommended to simply `drop` this reply guard instead of calling this function.
+    pub fn unlock(&mut self) -> bool {
+        if self.is_holding_lock {
+            self.is_holding_lock = false;
+            let mut inner = self.seq.inner.lock().unwrap();
+            inner.seq.unlock_raw();
+            self.seq.notify_reply(inner);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Break down a `ReplyGuard` into its primitive components, without causing it to send an ack
+    /// or reply to the remote peer.
+    ///
+    /// The first return value is the packet reply number, and the second is the return value of
+    /// `is_seq_cst`, which states whether or not this `ReplyGuard` is holding the SeqCst lock.
+    ///
+    /// This can be used in combination with `from_components` to move a `ReplyGuard` to a different
+    /// thread.
+    ///
+    /// # Safety
+    /// The caller must guarantee that `ReplyGuard::from_components` is eventually called on
+    /// the returned values.
+    ///
+    /// If this does not happen the SEQEX protocol will enter a deadlocked state,
+    /// which is likely to cause threads to permanently block.
     pub unsafe fn to_components(self) -> (SeqNo, bool) {
         let ret = (self.reply_no, self.is_holding_lock);
         core::mem::forget(self);
         ret
     }
     fn new(seq: &'a SeqEx<SendData, RecvData, CAP>, tl: TL, reply_no: SeqNo, is_holding_lock: bool) -> Self {
-        ReplyGuard { seq, tl, reply_no, is_holding_lock, has_replied: false }
+        ReplyGuard { seq, tl, reply_no, is_holding_lock }
     }
+    /// Constructs a `ReplyGuard` object from the raw components returned by
+    /// `ReplyGuard::to_components`.
+    ///
+    /// # Safety
+    /// The caller must always pass values for `reply_no` and `is_holding_lock` that were
+    /// originally returned by consuming a `ReplyGuard` instance with `to_components`.
+    ///
+    /// `seq` must be the exact same instance of `SeqEx` that issued the original `ReplyGuard`.
+    ///
+    /// Otherwise undefined behavior will occur.
     pub unsafe fn from_components(seq: &'a SeqEx<SendData, RecvData, CAP>, tl: TL, reply_no: SeqNo, is_holding_lock: bool) -> Self {
         Self::new(seq, tl, reply_no, is_holding_lock)
     }
@@ -115,10 +192,15 @@ impl<'a, TL: TokioLayer<SendData = SendData>, SendData, RecvData, const CAP: usi
 impl<'a, TL: TokioLayer<SendData = SendData>, SendData, RecvData, const CAP: usize> Drop for ReplyGuard<'a, TL, SendData, RecvData, CAP> {
     fn drop(&mut self) {
         let mut inner = self.seq.inner.lock().unwrap();
-        if !self.has_replied {
-            self.has_replied = true;
-            inner.seq.ack_raw(self.tl, self.reply_no, self.is_holding_lock);
-        }
+        inner.seq.ack_raw(self.tl, self.reply_no, self.is_holding_lock);
+        self.seq.notify_reply(inner);
+    }
+}
+impl<'a, SendData, RecvData, const CAP: usize> Drop for SeqCstGuard<'a, SendData, RecvData, CAP> {
+    fn drop(&mut self) {
+        let mut inner = self.seq.inner.lock().unwrap();
+        // It is guaranteed at this point for SeqEx to be locked because it was locked on guard creation.
+        inner.seq.unlock_raw();
         self.seq.notify_reply(inner);
     }
 }
