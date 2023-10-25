@@ -3,7 +3,7 @@ use std::{
         mpsc::{channel, Receiver, Sender},
         Condvar, Mutex, MutexGuard,
     },
-    time::Instant,
+    time::{Instant, Duration},
 };
 
 use crate::{
@@ -32,14 +32,14 @@ use crate::{
 pub struct SeqEx<SendData, RecvData, const CAP: usize = DEFAULT_WINDOW_CAP> {
     inner: Mutex<SeqExInner<SendData, RecvData, CAP>>,
     wait_on_recv: Condvar,
-    wait_on_reply_sender: Condvar,
-    wait_on_reply_receiver: Condvar,
+    wait_on_reply: Condvar,
 }
 struct SeqExInner<SendData, RecvData, const CAP: usize> {
     seq: crate::no_std::SeqEx<SendData, RecvData, CAP>,
     recv_waiters: usize,
     reply_sender_waiters: bool,
     reply_receiver_waiters: bool,
+    is_dead: bool,
 }
 /// A guard type that allows Rust's borrow-checker to guarantee that the invariants of the SEQEX
 /// protocol are maintained.
@@ -346,26 +346,21 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
                 recv_waiters: 0,
                 reply_sender_waiters: false,
                 reply_receiver_waiters: false,
+                is_dead: false,
             }),
             wait_on_recv: Condvar::default(),
-            wait_on_reply_receiver: Condvar::default(),
-            wait_on_reply_sender: Condvar::default(),
+            wait_on_reply: Condvar::default(),
         }
     }
     fn notify_reply(&self, mut inner: MutexGuard<'_, SeqExInner<SendData, RecvData, CAP>>) {
-        if inner.reply_receiver_waiters {
-            inner.reply_receiver_waiters = false;
-            drop(inner);
-            self.wait_on_reply_receiver.notify_all();
-        } else if inner.reply_sender_waiters {
+        if inner.reply_sender_waiters || inner.reply_receiver_waiters {
             inner.reply_sender_waiters = false;
             drop(inner);
-            self.wait_on_reply_sender.notify_all();
+            self.wait_on_reply.notify_all();
         }
     }
     fn notify_recv(&self, mut inner: MutexGuard<'_, SeqExInner<SendData, RecvData, CAP>>) {
         if inner.recv_waiters > 0 {
-            inner.recv_waiters -= 1;
             drop(inner);
             self.wait_on_recv.notify_one();
         }
@@ -384,6 +379,9 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
         packet: Packet<RecvData>,
     ) -> Result<(RecvOk<'_, TL, SendData, RecvData, CAP>, bool), RecvError> {
         let mut inner = self.inner.lock().unwrap();
+        if inner.is_dead {
+            return Err(RecvError::WaitingForRecv);
+        }
         match inner.seq.receive_raw(tl, packet) {
             Ok((r, do_pump)) => {
                 self.notify_recv(inner);
@@ -441,11 +439,11 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
     /// be processed in parallel.
     pub fn pump<TL: TransportLayer<SendData>>(&self, tl: TL) -> Option<(RecvOk<'_, TL, SendData, RecvData, CAP>, bool)> {
         let mut inner = self.inner.lock().unwrap();
-        // Enforce that only one thread may wait to pump at a time.
-        if inner.reply_receiver_waiters {
-            return None;
-        }
         loop {
+            // Enforce that only one thread may wait to pump at a time.
+            if inner.reply_receiver_waiters {
+                return None;
+            }
             match inner.seq.try_pump_raw() {
                 Ok((r, do_pump)) => {
                     self.notify_recv(inner);
@@ -454,7 +452,8 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
                 Err(TryError::WaitingForRecv) => return None,
                 Err(TryError::WaitingForReply) => {
                     inner.reply_receiver_waiters = true;
-                    inner = self.wait_on_reply_receiver.wait(inner).unwrap();
+                    inner = self.wait_on_reply.wait(inner).unwrap();
+                    inner.reply_receiver_waiters = false;
                 }
             }
         }
@@ -546,13 +545,17 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
             packet_data = p;
             match e {
                 TryError::WaitingForRecv => {
+                    if inner.is_dead {
+                        return None;
+                    }
                     inner.recv_waiters += 1;
                     inner = self.wait_on_recv.wait(inner).unwrap();
+                    inner.recv_waiters -= 1;
                     pre_nst = inner.seq.next_service_timestamp;
                 }
                 TryError::WaitingForReply => {
                     inner.reply_sender_waiters = true;
-                    inner = self.wait_on_reply_sender.wait(inner).unwrap();
+                    inner = self.wait_on_reply.wait(inner).unwrap();
                     pre_nst = inner.seq.next_service_timestamp;
                 }
             }
@@ -564,6 +567,7 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
     /// if the payload is not successfully received by the remote peer.
     ///
     /// If the either send or receive window is full, this function will block until they are not.
+    /// The amount of time this blocks for can depend on how long it takes the remote peer to respond.
     ///
     /// By default this function guarantees lossless transport. When `seq_cst` is set to true, this
     /// function also guarantees in-order transport.
@@ -583,19 +587,50 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
             packet_data = p;
             match e {
                 TryError::WaitingForRecv => {
+                    if inner.is_dead {
+                        return None;
+                    }
                     inner.recv_waiters += 1;
                     inner = self.wait_on_recv.wait(inner).unwrap();
+                    inner.recv_waiters -= 1;
                     pre_nst = inner.seq.next_service_timestamp;
                 }
                 TryError::WaitingForReply => {
                     inner.reply_sender_waiters = true;
-                    inner = self.wait_on_reply_sender.wait(inner).unwrap();
+                    inner = self.wait_on_reply.wait(inner).unwrap();
                     pre_nst = inner.seq.next_service_timestamp;
                 }
             }
         }
         let nst = inner.seq.next_service_timestamp;
         (pre_nst > nst).then_some(nst)
+    }
+    pub fn send_with_timeout<TL: TransportLayer<SendData>, F: FnOnce(SeqNo) -> SendData>(&self, tl: TL, seq_cst: bool, dur: Duration, mut packet_data: F) -> Result<Option<i64>, F> {
+        let mut inner = self.inner.lock().unwrap();
+        let mut pre_nst = inner.seq.next_service_timestamp;
+        while let Err((e, p)) = inner.seq.try_send_with(tl, seq_cst, packet_data) {
+            packet_data = p;
+            match e {
+                TryError::WaitingForRecv => {
+                    if inner.is_dead {
+                        return Err(packet_data);
+                    }
+                    inner.recv_waiters += 1;
+                    let result = self.wait_on_recv.wait_timeout(inner, dur).unwrap();
+                    inner.recv_waiters -= 1;
+                    result.1.timed_out()
+                    inner = .0;
+                    pre_nst = inner.seq.next_service_timestamp;
+                }
+                TryError::WaitingForReply => {
+                    inner.reply_sender_waiters = true;
+                    inner = self.wait_on_reply.wait(inner).unwrap();
+                    pre_nst = inner.seq.next_service_timestamp;
+                }
+            }
+        }
+        let nst = inner.seq.next_service_timestamp;
+        Ok((pre_nst > nst).then_some(nst))
     }
     /// Function which handles resending unacknowledged packets.
     /// It returns the duration of time in milliseconds that should be waited
@@ -629,6 +664,36 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
             tl.send(p)
         }
         inner.seq.next_service_timestamp
+    }
+    /// Normally if the send window is full, threads that call into `send` or `send_with` will block
+    /// until the remote peer acknowledges some of the packets in the send window.
+    /// If the remote peer does not send these acknowledgements, then these threads will be
+    /// permanently blocked, unless this function is called.
+    ///
+    /// This function cause all threads currently waiting for the remote peer to send us acks to
+    /// spuriously unblock and return. Future calls to `send` or `send_with` will spuriously return
+    /// instead of waiting for the remote peer to send acks.
+    /// Any future packets received from the remote peer will be dropped.
+    ///
+    /// Threads will still be able to `pump` and process anything left in the receive window, and
+    /// the critical section of SeqCst packets will be maintained. Calls to `service` will still
+    /// attempt to resend packets.
+    ///
+    /// Calling this function can cause data loss, but it will maintain state synchronization up to the
+    /// moment it was called, and prevent permanent blocking.
+    ///
+    /// If you are using functions `send` or `send_with`, and are communicating with an unreliable
+    /// peer, then threads permanently blocking is a possibility. To avoid this you must implement
+    /// some system that will detect if the remote peer has disconnected and call this function.
+    pub fn assume_dead_peer(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.is_dead = true;
+        self.notify_recv(inner);
+    }
+    /// Return whether or not `assume_dead_peer` has previously been called on this instance of `SeqEx`.
+    pub fn is_dead(&self) -> bool {
+        let inner = self.inner.lock().unwrap();
+        inner.is_dead
     }
 }
 impl<SendData, RecvData, const CAP: usize> Default for SeqEx<SendData, RecvData, CAP> {
