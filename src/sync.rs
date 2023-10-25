@@ -621,7 +621,7 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
     /// that schedule whenever `SeqEx::send`, `ReplyGuard::reply` or any of their variants are called.
     ///
     /// It is recommended to just use `SeqEx::service`.
-    pub fn service_scheduled(&mut self, mut tl: impl TransportLayer<SendData>) -> i64 {
+    pub fn service_scheduled(&self, mut tl: impl TransportLayer<SendData>) -> i64 {
         let mut inner = self.inner.lock().unwrap();
         let current_time = tl.time();
         let mut iter = None;
