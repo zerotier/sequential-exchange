@@ -13,6 +13,8 @@ pub struct SeqEx<SendData, RecvData, const CAP: usize = DEFAULT_WINDOW_CAP> {
     /// remote peer.
     /// It can be statically or dynamically set.
     pub resend_interval: i64,
+    /// The timestamp at which `service_direct` should be called again.
+    /// This can be `i64::MAX` does not currently need to be called again.
     pub next_service_timestamp: i64,
     next_send_seq_no: SeqNo,
     next_recv_seq_no: SeqNo,

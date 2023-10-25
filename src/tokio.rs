@@ -38,12 +38,20 @@ pub struct SeqCstGuard<'a, SendData, RecvData, const CAP: usize = DEFAULT_WINDOW
 }
 
 impl<'a, TL: TokioLayer<SendData = SendData>, SendData, RecvData, const CAP: usize> ReplyGuard<'a, TL, SendData, RecvData, CAP> {
+    /// Returns a reference to the `TransportLayer` instance this guard was created with.
     pub fn get_tl(&self) -> &TL {
         &self.tl
     }
+    /// Returns a mutable reference to the `TransportLayer` instance this guard was created with.
     pub fn get_tl_mut(&mut self) -> &mut TL {
         &mut self.tl
     }
+    /// Returns whether or nor this reply guard is for a SeqCst packet, and therefore is
+    /// holding the SeqCst lock, preventing other SeqCst packets from being processed.
+    ///
+    /// When this returns `true`, it means the current thread is within the critical section for
+    /// processing SeqCst packets. SeqCst packets can only enter this critical section in the same
+    /// order they were sent.
     pub fn is_seq_cst(&self) -> bool {
         self.is_holding_lock
     }
@@ -144,6 +152,21 @@ impl<'a, TL: TokioLayer<SendData = SendData>, SendData, RecvData, const CAP: usi
         }
     }
 
+    /// Break down a `ReplyGuard` into its primitive components, without causing it to send an ack
+    /// or reply to the remote peer.
+    ///
+    /// The first return value is the packet reply number, and the second is the return value of
+    /// `is_seq_cst`, which states whether or not this `ReplyGuard` is holding the SeqCst lock.
+    ///
+    /// This can be used in combination with `from_components` to move a `ReplyGuard` to a different
+    /// thread.
+    ///
+    /// # Safety
+    /// The caller must guarantee that `ReplyGuard::from_components` is eventually called on
+    /// the returned values.
+    ///
+    /// If this does not happen the SEQEX protocol will enter a deadlocked state,
+    /// which is likely to cause threads to permanently block.
     pub unsafe fn to_components(self) -> (SeqNo, bool) {
         let ret = (self.reply_no, self.is_holding_lock);
         core::mem::forget(self);
@@ -152,6 +175,16 @@ impl<'a, TL: TokioLayer<SendData = SendData>, SendData, RecvData, const CAP: usi
     fn new(seq: &'a SeqEx<SendData, RecvData, CAP>, tl: TL, reply_no: SeqNo, is_holding_lock: bool) -> Self {
         ReplyGuard { seq, tl, reply_no, is_holding_lock }
     }
+    /// Constructs a `ReplyGuard` object from the raw components returned by
+    /// `ReplyGuard::to_components`.
+    ///
+    /// # Safety
+    /// The caller must always pass values for `reply_no` and `is_holding_lock` that were
+    /// originally returned by consuming a `ReplyGuard` instance with `to_components`.
+    ///
+    /// `seq` must be the exact same instance of `SeqEx` that issued the original `ReplyGuard`.
+    ///
+    /// Otherwise undefined behavior will occur.
     pub unsafe fn from_components(seq: &'a SeqEx<SendData, RecvData, CAP>, tl: TL, reply_no: SeqNo, is_holding_lock: bool) -> Self {
         Self::new(seq, tl, reply_no, is_holding_lock)
     }

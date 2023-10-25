@@ -33,7 +33,7 @@
 //! different protocol layer.
 //!
 //! Neither SEQEX nor TCP are cryptographically secure.
-#![warn(missing_docs, rust_2018_idioms)]
+//#![warn(missing_docs, rust_2018_idioms)]
 
 mod transport_layer;
 pub use transport_layer::*;
