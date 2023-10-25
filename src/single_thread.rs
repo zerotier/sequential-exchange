@@ -26,8 +26,8 @@ impl<'a, TL: TransportLayer<SendData>, SendData, RecvData, const CAP: usize> Rep
     pub fn get_tl_mut(&mut self) -> &mut TL {
         &mut self.tl
     }
-    /// Returns whether or nor this reply guard is for a SeqCst packet, and therefore is
-    /// holding the SeqCst lock, preventing other SeqCst packets from being processed.
+    /// Returns whether or nor this reply guard is currently holding the SeqCst lock,
+    /// preventing other SeqCst packets from being processed.
     ///
     /// When this returns `true`, it means the current thread is within the critical section for
     /// processing SeqCst packets. SeqCst packets can only enter this critical section in the same
