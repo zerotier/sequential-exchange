@@ -431,6 +431,11 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
         }
     }
     /// If `unlock` is true and the return value is `Some` pump may return new values.
+    ///
+    /// # Panics
+    /// This function will debug panic if `unlock` is `true` while this instance of `SeqEx` is not
+    /// locked. This would be equivalent to double-unlocking a mutex, and is a sign the user is
+    /// not making correct use of SeqCst packets.
     #[must_use]
     pub fn ack_raw_and_direct(&mut self, reply_no: SeqNo, unlock: bool) -> Option<Packet<&SendData>> {
         if self.remove_reservation(reply_no) {
@@ -442,6 +447,13 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
         } else {
             None
         }
+    }
+    /// If this is called, pump may return new values.
+    ///
+    /// If this function is called then this instance of SeqEx will no longer be considered "locked".
+    /// Any calls to `ack_raw_and_direct` should take this into account and not set `unlock` to `true`.
+    pub fn unlock_raw(&mut self) {
+        self.is_locked = false;
     }
 
     /// Can increase `next_service_timestamp`.

@@ -1,5 +1,5 @@
-use crate::no_std::{RecvOkRaw, SeqEx};
 use crate::error::{RecvError, TryError, TryRecvError};
+use crate::no_std::{RecvOkRaw, SeqEx};
 use crate::{Packet, SeqNo, TransportLayer, DEFAULT_WINDOW_CAP};
 
 pub struct ReplyGuard<'a, TL: TransportLayer<SendData>, SendData, RecvData, const CAP: usize = DEFAULT_WINDOW_CAP> {
@@ -7,47 +7,75 @@ pub struct ReplyGuard<'a, TL: TransportLayer<SendData>, SendData, RecvData, cons
     tl: TL,
     reply_no: SeqNo,
     is_holding_lock: bool,
-    has_replied: bool,
 }
+
+pub struct SeqCstGuard<'a, SendData, RecvData, const CAP: usize = DEFAULT_WINDOW_CAP> {
+    seq: &'a mut SeqEx<SendData, RecvData, CAP>,
+}
+
 impl<'a, TL: TransportLayer<SendData>, SendData, RecvData, const CAP: usize> ReplyGuard<'a, TL, SendData, RecvData, CAP> {
+    pub fn get_seqex(&'a mut self) -> &'a mut SeqEx<SendData, RecvData, CAP> {
+        self.seq
+    }
     pub fn get_tl(&self) -> &TL {
         &self.tl
     }
     pub fn get_tl_mut(&mut self) -> &mut TL {
         &mut self.tl
     }
-    pub fn has_replied(&self) -> bool {
-        self.has_replied
-    }
     pub fn is_seq_cst(&self) -> bool {
         self.is_holding_lock
-    }
-
-    pub fn ack(&mut self) {
-        if !self.has_replied {
-            self.has_replied = true;
-            self.seq.ack_raw(self.tl, self.reply_no, self.is_holding_lock);
-        }
     }
     /// If you need to reply more than once, say to fragment a large file, then include in your
     /// first reply some identifier, and then `send` all fragments with the same included identifier.
     /// The identifier will tell the remote peer which packets contain fragments of the file,
     /// and since each fragment will be received in order it will be trivial for them to reconstruct
     /// the original file.
-    /// # Panic
-    /// This function will panic if `ack` has been called.
     pub fn reply(self, seq_cst: bool, packet_data: SendData) {
         self.reply_with(seq_cst, |_, _| packet_data)
     }
-    /// # Panic
-    /// This function will panic if `ack` has been called.
-    fn reply_with(mut self, seq_cst: bool, packet_data: impl FnOnce(SeqNo, SeqNo) -> SendData) {
-        assert!(!self.has_replied, "Cannot reply after an ack has been sent");
-        self.has_replied = true;
+    pub fn reply_with(self, seq_cst: bool, packet_data: impl FnOnce(SeqNo, SeqNo) -> SendData) {
         let seq_no = self.seq.seq_no();
         self.seq
             .reply_raw(self.tl, self.reply_no, self.is_holding_lock, seq_cst, packet_data(seq_no, self.reply_no));
         core::mem::forget(self);
+    }
+
+    fn consume_lock(self) -> Option<SeqCstGuard<'a, SendData, RecvData, CAP>> {
+        let ret = if self.is_holding_lock {
+            let seq = self.seq as *mut SeqEx<SendData, RecvData, CAP>;
+            Some(SeqCstGuard { seq: unsafe { seq.as_mut().unwrap_unchecked() } })
+        } else {
+            None
+        };
+        core::mem::forget(self);
+        ret
+    }
+    pub fn ack(self) -> Option<SeqCstGuard<'a, SendData, RecvData, CAP>> {
+        self.seq.ack_raw(self.tl, self.reply_no, false);
+        self.consume_lock()
+    }
+    pub fn unlock(&mut self) -> bool {
+        if self.is_holding_lock {
+            self.is_holding_lock = false;
+            self.seq.unlock_raw();
+            true
+        } else {
+            false
+        }
+    }
+    pub fn reply_stay_locked(self, seq_cst: bool, packet_data: SendData) -> Option<SeqCstGuard<'a, SendData, RecvData, CAP>> {
+        self.reply_with_stay_locked(seq_cst, |_, _| packet_data)
+    }
+    pub fn reply_with_stay_locked(
+        self,
+        seq_cst: bool,
+        packet_data: impl FnOnce(SeqNo, SeqNo) -> SendData,
+    ) -> Option<SeqCstGuard<'a, SendData, RecvData, CAP>> {
+        let seq_no = self.seq.seq_no();
+        self.seq
+            .reply_raw(self.tl, self.reply_no, false, seq_cst, packet_data(seq_no, self.reply_no));
+        self.consume_lock()
     }
 
     pub unsafe fn to_components(self) -> (SeqNo, bool) {
@@ -56,7 +84,7 @@ impl<'a, TL: TransportLayer<SendData>, SendData, RecvData, const CAP: usize> Rep
         ret
     }
     fn new(seq: &'a mut SeqEx<SendData, RecvData, CAP>, tl: TL, reply_no: SeqNo, is_holding_lock: bool) -> Self {
-        ReplyGuard { seq, tl, reply_no, is_holding_lock, has_replied: false }
+        ReplyGuard { seq, tl, reply_no, is_holding_lock }
     }
     pub unsafe fn from_components(seq: &'a mut SeqEx<SendData, RecvData, CAP>, tl: TL, reply_no: SeqNo, is_holding_lock: bool) -> Self {
         Self::new(seq, tl, reply_no, is_holding_lock)
@@ -64,7 +92,12 @@ impl<'a, TL: TransportLayer<SendData>, SendData, RecvData, const CAP: usize> Rep
 }
 impl<'a, TL: TransportLayer<SendData>, SendData, RecvData, const CAP: usize> Drop for ReplyGuard<'a, TL, SendData, RecvData, CAP> {
     fn drop(&mut self) {
-        self.ack();
+        self.seq.ack_raw(self.tl, self.reply_no, self.is_holding_lock);
+    }
+}
+impl<'a, SendData, RecvData, const CAP: usize> Drop for SeqCstGuard<'a, SendData, RecvData, CAP> {
+    fn drop(&mut self) {
+        self.seq.unlock_raw();
     }
 }
 impl<'a, TL: TransportLayer<SendData>, SendData, RecvData, const CAP: usize> std::fmt::Debug for ReplyGuard<'a, TL, SendData, RecvData, CAP> {
