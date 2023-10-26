@@ -5,7 +5,7 @@ use tokio::{
 };
 
 use crate::{
-    error::{RecvError, TryError},
+    error::{TryError, TryRecvError},
     no_std::RecvOkRaw,
     Packet, SeqNo, TransportLayer, DEFAULT_INITIAL_SEQ_NO, DEFAULT_RESEND_INTERVAL_MS, DEFAULT_WINDOW_CAP,
 };
@@ -295,7 +295,7 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
         packet: Packet<IntoOneshot<'_, RecvData>>,
     ) -> Result<(ReplyGuard<'_, TL, SendData, RecvData, CAP>, RecvData), Option<AsyncRecvError>> {
         let mut inner = self.inner.lock().unwrap();
-        return match inner.seq.receive_raw(tl, packet) {
+        return match inner.seq.try_receive_raw(tl, packet) {
             Ok((recv_data, do_pump)) => {
                 // pump first, handle return value second.
                 let mut total_recv = 1;
@@ -350,9 +350,9 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
                 }
                 ret
             }
-            Err(RecvError::DroppedTooEarly) => Err(Some(AsyncRecvError::DroppedTooEarly)),
-            Err(RecvError::DroppedDuplicate) => Err(Some(AsyncRecvError::DroppedDuplicate)),
-            Err(RecvError::WaitingForRecv) | Err(RecvError::WaitingForReply) => Err(None),
+            Err(TryRecvError::DroppedTooEarly) => Err(Some(AsyncRecvError::DroppedTooEarly)),
+            Err(TryRecvError::DroppedDuplicate) => Err(Some(AsyncRecvError::DroppedDuplicate)),
+            Err(TryRecvError::WaitingForRecv) | Err(TryRecvError::WaitingForReply) => Err(None),
         };
     }
 

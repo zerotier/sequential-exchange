@@ -47,15 +47,15 @@ fn main() {
     let mut value = 0.0;
     let mut remote_value = value;
 
-    seq1.send(&transport1, true, Payload::Add(1.0));
+    seq1.send(&transport1, true, Payload::Add(1.0)).unwrap();
     value += 1.0;
-    seq1.send(&transport1, true, Payload::Sub(2.0));
+    seq1.send(&transport1, true, Payload::Sub(2.0)).unwrap();
     value -= 2.0;
-    seq1.send(&transport1, true, Payload::Mul(3.0));
+    seq1.send(&transport1, true, Payload::Mul(3.0)).unwrap();
     value *= 3.0;
-    seq1.send(&transport1, true, Payload::Div(4.0));
+    seq1.send(&transport1, true, Payload::Div(4.0)).unwrap();
     value /= 4.0;
-    seq1.send(&transport1, true, Payload::Mod(5.0));
+    seq1.send(&transport1, true, Payload::Mod(5.0)).unwrap();
     value %= 5.0;
 
     for _ in 0..16 {
