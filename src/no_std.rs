@@ -1,11 +1,7 @@
-pub use crate::single_thread::*;
-
-use crate::{
-    error::{TryError, TryRawRecvError},
-    transport_layer::SeqNo,
-    Packet, DEFAULT_INITIAL_SEQ_NO, DEFAULT_RESEND_INTERVAL_MS, DEFAULT_WINDOW_CAP,
-};
+use crate::{transport_layer::SeqNo, Packet, DEFAULT_INITIAL_SEQ_NO, DEFAULT_RESEND_INTERVAL_MS, DEFAULT_WINDOW_CAP};
 use Packet::*;
+
+pub use crate::single_thread::*;
 
 #[derive(Debug)]
 pub struct SeqEx<SendData, RecvData, const CAP: usize = DEFAULT_WINDOW_CAP> {
