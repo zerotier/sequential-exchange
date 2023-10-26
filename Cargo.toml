@@ -10,7 +10,7 @@ path = "src/lib.rs"
 doc = true
 
 [features]
-default = ["serde", "std"]
+default = ["serde", "std", "tokio"]
 tokio = ["std", "dep:tokio"]
 std = []
 
