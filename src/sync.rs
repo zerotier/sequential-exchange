@@ -6,11 +6,9 @@ use std::{
     time::Instant,
 };
 
-use crate::{
-    error::{ClosedError, RecvError, TryError, TrySendError},
-    no_std::RecvOkRaw,
-    Packet, SeqNo, TransportLayer, DEFAULT_INITIAL_SEQ_NO, DEFAULT_RESEND_INTERVAL_MS, DEFAULT_WINDOW_CAP,
-};
+use crate::{no_std::RecvOkRaw, Packet, SeqNo, TransportLayer, DEFAULT_INITIAL_SEQ_NO, DEFAULT_RESEND_INTERVAL_MS, DEFAULT_WINDOW_CAP};
+
+pub use crate::no_std::TryError;
 
 /// The core thread-safe datastructure which manages the SEQEX protocol.
 ///
@@ -385,17 +383,22 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
         &self,
         tl: TL,
         packet: Packet<RecvData>,
-    ) -> Result<(RecvOk<'_, TL, SendData, RecvData, CAP>, bool), RecvError> {
+    ) -> Result<(RecvOk<'_, TL, SendData, RecvData, CAP>, bool), TryRecvError> {
         let mut inner = self.inner.lock().unwrap();
         if inner.closed {
-            return Err(RecvError::Closed);
+            return Err(TryRecvError::Closed);
         }
         match inner.seq.try_receive_raw(tl, packet) {
             Ok((r, do_pump)) => {
                 self.notify_recv(inner);
                 Ok((RecvOk::from_raw(self, tl, r), do_pump))
             }
-            Err(e) => Err(e.into()),
+            Err(e) => Err(match e {
+                crate::no_std::TryRecvError::DroppedTooEarly => TryRecvError::DroppedTooEarly,
+                crate::no_std::TryRecvError::DroppedDuplicate => TryRecvError::DroppedDuplicate,
+                crate::no_std::TryRecvError::WaitingForRecv => TryRecvError::WaitingForRecv,
+                crate::no_std::TryRecvError::WaitingForReply => TryRecvError::WaitingForReply,
+            }),
         }
     }
     /// A SEQEX packet was just received and deserialized from the transport layer.
@@ -418,12 +421,21 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
         tl: TL,
         packet: Packet<RecvData>,
     ) -> Result<(RecvOk<'_, TL, SendData, RecvData, CAP>, bool), RecvError> {
-        let result = self.try_receive(tl, packet);
-        if let Err(RecvError::WaitingForReply) = result {
-            self.pump(tl).ok_or(RecvError::WaitingForReply)
-        } else {
-            result
+        match self.try_receive(tl, packet) {
+            Ok(r) => Ok(r),
+            Err(e) => match e {
+                TryRecvError::WaitingForReply => self.pump(tl).ok_or(RecvError::WaitingForRecv),
+                TryRecvError::WaitingForRecv => Err(RecvError::WaitingForRecv),
+                TryRecvError::DroppedTooEarly => Err(RecvError::DroppedTooEarly),
+                TryRecvError::DroppedDuplicate => Err(RecvError::DroppedDuplicate),
+                TryRecvError::Closed => Err(RecvError::Closed),
+            },
         }
+        //if let Err(TryRecvError::WaitingForReply) = result {
+        //    self.pump(tl).ok_or(RecvError::WaitingForRecv)
+        //} else {
+        //    result
+        //}
     }
     /// Non-blocking variant of `SeqEx::pump`.
     /// See the documentation for `SeqEx::pump` for more information.
@@ -788,5 +800,147 @@ impl<Payload: Clone> TransportLayer<Payload> for &MpscTransport<Payload> {
 
     fn send(&mut self, packet: Packet<&Payload>) {
         let _ = self.channel.send(packet.cloned());
+    }
+}
+
+/// These are the error types that can be returned by `SeqEx::try_receive`.
+///
+/// Some of these errors specify that SEQEX is waiting on some event to occur before it can proceed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TryRecvError {
+    /// Either the receive window is full, or the received packet is SeqCst and cannot enter the
+    /// critical section where it is processed. In either case there currently exists some reply
+    /// guard that must be dropped or consumed before this packet can be processed.
+    ///
+    /// If the receive window was full, the packet was dropped.
+    /// Otherwise if the packet is SeqCst, then the packet was saved to the receive window.
+    WaitingForReply,
+    /// In order to preserve losslessness or in-order transport, the received packet cannot be
+    /// process until some other packet is received. The packet was saved to the receive window.
+    WaitingForRecv,
+    /// This packet had to be dropped because it arrived far enough out-of-order that it was outside
+    /// the receive window.
+    /// This packet will eventually be resent, so no data will be lost.
+    DroppedTooEarly,
+    /// This packet was a duplicate of a previously received packet. It must have been resent before
+    /// the remote peer received the ack for the packet.
+    /// Since this packet is a duplicate, no data is lost by dropping it.
+    DroppedDuplicate,
+    /// This instance of `SeqEx` has been explicitly closed.
+    /// It can no longer send or receive data.
+    ///
+    /// This error can only occur after `SeqEx::close` has been called.
+    /// An instance of `SeqEx` will never close by itself, only the caller can close it.
+    Closed,
+}
+/// These are the error types that can be returned by `SeqEx::receive`.
+///
+/// Some of these errors specify that SEQEX is waiting on some event to occur before it can proceed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecvError {
+    /// In order to preserve losslessness or in-order transport, the received packet cannot be
+    /// process until some other packet is received. The packet was saved to the receive window.
+    WaitingForRecv,
+    /// This packet had to be dropped because it arrived far enough out-of-order that it was outside
+    /// the receive window.
+    /// This packet will eventually be resent, so no data will be lost.
+    DroppedTooEarly,
+    /// This packet was a duplicate of a previously received packet. It must have been resent before
+    /// the remote peer received the ack for the packet.
+    /// Since this packet is a duplicate, no data is lost by dropping it.
+    DroppedDuplicate,
+    /// This instance of `SeqEx` has been explicitly closed.
+    /// It can no longer send or receive data.
+    ///
+    /// This error can only occur after `SeqEx::close` has been called.
+    /// An instance of `SeqEx` will never close by itself, only the caller can close it.
+    Closed,
+}
+/// A generic error that can be returned by a `try_send` or `try_pump` function.
+/// They specify what event must occur before a future call to `try_send` or `try_pump` can succeed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrySendError {
+    /// The packet could not be sent or processed at this time.
+    /// Some other packet must be received from the remote peer first.
+    WaitingForRecv,
+    /// Some currently issued reply number must be returned to SEQEX to send either an Ack or a
+    /// Reply. If using reply guards, then some currently existing reply guard must be dropped or
+    /// consumed.
+    /// Until this occurs the packet cannot be sent or processed.
+    WaitingForReply,
+    /// This instance of `SeqEx` has been explicitly closed.
+    /// It can no longer send or receive data.
+    ///
+    /// This error can only occur after `SeqEx::close` has been called.
+    /// An instance of `SeqEx` will never close by itself, only the caller can close it.
+    Closed,
+}
+
+/// This instance of `SeqEx` has been explicitly closed.
+/// It can no longer send or receive data.
+///
+/// This error can only occur after `SeqEx::close` has been called.
+/// An instance of `SeqEx` will never close by itself, only the caller can close it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClosedError;
+
+impl std::fmt::Display for TryRecvError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DroppedTooEarly => write!(f, "packet arrived too early"),
+            Self::DroppedDuplicate => write!(f, "packet was a duplicate"),
+            Self::WaitingForRecv => write!(f, "can't process packet until another packet is received"),
+            Self::WaitingForReply => write!(f, "can't process packet until a reply is finished"),
+            Self::Closed => write!(f, "can't receive packet because the session was explicitly closed"),
+        }
+    }
+}
+impl std::error::Error for TryRecvError {}
+
+impl std::fmt::Display for RecvError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let e: TryRecvError = (*self).into();
+        e.fmt(f)
+    }
+}
+impl std::error::Error for RecvError {}
+
+#[cfg(feature = "std")]
+impl std::fmt::Display for TrySendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TrySendError::WaitingForRecv => write!(f, "can't send until another packet is received"),
+            TrySendError::WaitingForReply => write!(f, "can't send until a reply is finished"),
+            TrySendError::Closed => write!(f, "can't send because the session was explicitly closed"),
+        }
+    }
+}
+#[cfg(feature = "std")]
+impl std::error::Error for TrySendError {}
+
+impl std::fmt::Display for ClosedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "can't send because the session was explicitly closed")
+    }
+}
+impl std::error::Error for ClosedError {}
+
+impl From<RecvError> for TryRecvError {
+    fn from(value: RecvError) -> Self {
+        match value {
+            RecvError::WaitingForRecv => TryRecvError::WaitingForRecv,
+            RecvError::DroppedTooEarly => TryRecvError::DroppedTooEarly,
+            RecvError::DroppedDuplicate => TryRecvError::DroppedDuplicate,
+            RecvError::Closed => TryRecvError::Closed,
+        }
+    }
+}
+
+impl From<TryError> for TrySendError {
+    fn from(value: TryError) -> Self {
+        match value {
+            TryError::WaitingForRecv => TrySendError::WaitingForRecv,
+            TryError::WaitingForReply => TrySendError::WaitingForReply,
+        }
     }
 }
