@@ -70,7 +70,7 @@ fn process(peer: &Peer, recv_data: RecvOk<'_, &Transport, Payload, Payload>) {
                     let mut i = 0;
                     while i < file.len() {
                         let j = file.len().min(i + FILE_CHUNK_SIZE);
-                        seqex.send(
+                        let _ = seqex.send(
                             &transport,
                             true,
                             FileDownload { filename: filename.clone(), file_chunk: file[i..j].to_vec() },
@@ -142,9 +142,18 @@ fn main() {
     };
 
     let tl = &peer1.transport;
-    peer1.seqex.send(tl, false, Payload::RequestFile { filename: "File1".to_string() });
-    peer1.seqex.send(tl, false, Payload::RequestFile { filename: "File3".to_string() });
-    peer1.seqex.send(tl, false, Payload::RequestFile { filename: "File2".to_string() });
+    peer1
+        .seqex
+        .send(tl, false, Payload::RequestFile { filename: "File1".to_string() })
+        .unwrap();
+    peer1
+        .seqex
+        .send(tl, false, Payload::RequestFile { filename: "File3".to_string() })
+        .unwrap();
+    peer1
+        .seqex
+        .send(tl, false, Payload::RequestFile { filename: "File2".to_string() })
+        .unwrap();
 
     for _ in 0..400 {
         receive(&peer1);

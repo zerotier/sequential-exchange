@@ -3,11 +3,11 @@ use std::{
         mpsc::{channel, Receiver, Sender},
         Condvar, Mutex, MutexGuard,
     },
-    time::{Instant, Duration},
+    time::Instant,
 };
 
 use crate::{
-    error::{RecvError, TryError},
+    error::{ClosedError, RecvError, TryError, TrySendError},
     no_std::RecvOkRaw,
     Packet, SeqNo, TransportLayer, DEFAULT_INITIAL_SEQ_NO, DEFAULT_RESEND_INTERVAL_MS, DEFAULT_WINDOW_CAP,
 };
@@ -39,7 +39,7 @@ struct SeqExInner<SendData, RecvData, const CAP: usize> {
     recv_waiters: usize,
     reply_sender_waiters: bool,
     reply_receiver_waiters: bool,
-    is_dead: bool,
+    closed: bool,
 }
 /// A guard type that allows Rust's borrow-checker to guarantee that the invariants of the SEQEX
 /// protocol are maintained.
@@ -97,13 +97,16 @@ impl<'a, TL: TransportLayer<SendData>, SendData, RecvData, const CAP: usize> Rep
     ///
     /// Returns the timestamp of when `service_scheduled` should be called next, only if it has decrease.
     /// This can be safely ignored if `service_scheduled` is not being used.
-    pub fn reply_with(self, seq_cst: bool, packet_data: impl FnOnce(SeqNo, SeqNo) -> SendData) -> Option<i64> {
+    pub fn reply_with(self, seq_cst: bool, f: impl FnOnce(SeqNo, SeqNo) -> SendData) -> Option<i64> {
         let mut inner = self.seq.inner.lock().unwrap();
+        if inner.closed {
+            return None;
+        }
         let pre_nst = inner.seq.next_service_timestamp;
         let seq_no = inner.seq.seq_no();
         inner
             .seq
-            .reply_raw(self.tl, self.reply_no, self.is_holding_lock, seq_cst, packet_data(seq_no, self.reply_no));
+            .reply_raw(self.tl, self.reply_no, self.is_holding_lock, seq_cst, f(seq_no, self.reply_no));
         let nst = inner.seq.next_service_timestamp;
         self.seq.notify_reply(inner);
         core::mem::forget(self);
@@ -151,7 +154,9 @@ impl<'a, TL: TransportLayer<SendData>, SendData, RecvData, const CAP: usize> Rep
     /// Casual users are recommended to simply `drop` this reply guard instead of calling this function.
     pub fn ack(self) -> Option<SeqCstGuard<'a, SendData, RecvData, CAP>> {
         let mut inner = self.seq.inner.lock().unwrap();
-        inner.seq.ack_raw(self.tl, self.reply_no, false);
+        if !inner.closed {
+            inner.seq.ack_raw(self.tl, self.reply_no, false);
+        }
         self.consume_lock(inner)
     }
     /// If this guard is holding the SeqCst lock, and preventing other SeqCst packets from
@@ -188,14 +193,15 @@ impl<'a, TL: TransportLayer<SendData>, SendData, RecvData, const CAP: usize> Rep
     pub fn reply_with_stay_locked(
         self,
         seq_cst: bool,
-        packet_data: impl FnOnce(SeqNo, SeqNo) -> SendData,
+        f: impl FnOnce(SeqNo, SeqNo) -> SendData,
     ) -> (Option<SeqCstGuard<'a, SendData, RecvData, CAP>>, Option<i64>) {
         let mut inner = self.seq.inner.lock().unwrap();
+        if inner.closed {
+            return (self.consume_lock(inner), None);
+        }
         let pre_nst = inner.seq.next_service_timestamp;
         let seq_no = inner.seq.seq_no();
-        inner
-            .seq
-            .reply_raw(self.tl, self.reply_no, false, seq_cst, packet_data(seq_no, self.reply_no));
+        inner.seq.reply_raw(self.tl, self.reply_no, false, seq_cst, f(seq_no, self.reply_no));
         let nst = inner.seq.next_service_timestamp;
 
         (self.consume_lock(inner), (pre_nst > nst).then_some(nst))
@@ -260,7 +266,9 @@ impl<'a, TL: TransportLayer<SendData>, SendData, RecvData, const CAP: usize> Rep
 impl<'a, TL: TransportLayer<SendData>, SendData, RecvData, const CAP: usize> Drop for ReplyGuard<'a, TL, SendData, RecvData, CAP> {
     fn drop(&mut self) {
         let mut inner = self.seq.inner.lock().unwrap();
-        inner.seq.ack_raw(self.tl, self.reply_no, self.is_holding_lock);
+        if !inner.closed {
+            inner.seq.ack_raw(self.tl, self.reply_no, self.is_holding_lock);
+        }
         self.seq.notify_reply(inner);
     }
 }
@@ -346,7 +354,7 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
                 recv_waiters: 0,
                 reply_sender_waiters: false,
                 reply_receiver_waiters: false,
-                is_dead: false,
+                closed: false,
             }),
             wait_on_recv: Condvar::default(),
             wait_on_reply: Condvar::default(),
@@ -359,7 +367,7 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
             self.wait_on_reply.notify_all();
         }
     }
-    fn notify_recv(&self, mut inner: MutexGuard<'_, SeqExInner<SendData, RecvData, CAP>>) {
+    fn notify_recv(&self, inner: MutexGuard<'_, SeqExInner<SendData, RecvData, CAP>>) {
         if inner.recv_waiters > 0 {
             drop(inner);
             self.wait_on_recv.notify_one();
@@ -379,15 +387,15 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
         packet: Packet<RecvData>,
     ) -> Result<(RecvOk<'_, TL, SendData, RecvData, CAP>, bool), RecvError> {
         let mut inner = self.inner.lock().unwrap();
-        if inner.is_dead {
-            return Err(RecvError::WaitingForRecv);
+        if inner.closed {
+            return Err(RecvError::Closed);
         }
-        match inner.seq.receive_raw(tl, packet) {
+        match inner.seq.try_receive_raw(tl, packet) {
             Ok((r, do_pump)) => {
                 self.notify_recv(inner);
                 Ok((RecvOk::from_raw(self, tl, r), do_pump))
             }
-            Err(e) => Err(e),
+            Err(e) => Err(e.into()),
         }
     }
     /// A SEQEX packet was just received and deserialized from the transport layer.
@@ -405,12 +413,16 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
     /// the caller can now process, and the second value is a boolean specifying if there is yet
     /// more received data to be processed. This boolean is true if `SeqEx::pump` should be called,
     /// because there are more packets ready to be processed in the receive window.
-    pub fn receive<TL: TransportLayer<SendData>>(&self, tl: TL, packet: Packet<RecvData>) -> Option<(RecvOk<'_, TL, SendData, RecvData, CAP>, bool)> {
+    pub fn receive<TL: TransportLayer<SendData>>(
+        &self,
+        tl: TL,
+        packet: Packet<RecvData>,
+    ) -> Result<(RecvOk<'_, TL, SendData, RecvData, CAP>, bool), RecvError> {
         let result = self.try_receive(tl, packet);
         if let Err(RecvError::WaitingForReply) = result {
-            self.pump(tl)
+            self.pump(tl).ok_or(RecvError::WaitingForReply)
         } else {
-            result.ok()
+            result
         }
     }
     /// Non-blocking variant of `SeqEx::pump`.
@@ -439,11 +451,11 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
     /// be processed in parallel.
     pub fn pump<TL: TransportLayer<SendData>>(&self, tl: TL) -> Option<(RecvOk<'_, TL, SendData, RecvData, CAP>, bool)> {
         let mut inner = self.inner.lock().unwrap();
+        // Enforce that only one thread may wait to pump at a time.
+        if inner.reply_receiver_waiters {
+            return None;
+        }
         loop {
-            // Enforce that only one thread may wait to pump at a time.
-            if inner.reply_receiver_waiters {
-                return None;
-            }
             match inner.seq.try_pump_raw() {
                 Ok((r, do_pump)) => {
                     self.notify_recv(inner);
@@ -462,7 +474,7 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
     /// automatically calls `SeqEx::pump` as many times as needed to empty the receive window.
     pub fn receive_all<TL: TransportLayer<SendData>>(&self, tl: TL, packet: Packet<RecvData>) -> RecvIter<'_, TL, SendData, RecvData, CAP> {
         let ret = self.receive(tl, packet);
-        if let Some((first, do_pump)) = ret {
+        if let Ok((first, do_pump)) = ret {
             RecvIter {
                 seq: do_pump.then_some(self),
                 tl,
@@ -506,14 +518,21 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
         &self,
         tl: TL,
         seq_cst: bool,
-        packet_data: F,
-    ) -> Result<Option<i64>, (TryError, F)> {
+        f: F,
+    ) -> Result<Option<i64>, (TrySendError, F)> {
         let mut inner = self.inner.lock().unwrap();
+        if inner.closed {
+            return Err((TrySendError::Closed, f));
+        }
         let pre_nst = inner.seq.next_service_timestamp;
-        inner.seq.try_send_with(tl, seq_cst, packet_data).map(|()| {
-            let nst = inner.seq.next_service_timestamp;
-            (pre_nst > nst).then_some(nst)
-        })
+        inner
+            .seq
+            .try_send_with(tl, seq_cst, f)
+            .map(|()| {
+                let nst = inner.seq.next_service_timestamp;
+                (pre_nst > nst).then_some(nst)
+            })
+            .map_err(|(e, b)| (e.into(), b))
     }
     /// Non-blocking variant of `SeqEx::send`.
     /// See the documentation for `SeqEx::send` for more information.
@@ -522,13 +541,25 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
     ///
     /// A return value of `Ok` contains the timestamp of when `service_scheduled` should be called next,
     /// only if it has decrease. This can be safely ignored if `service_scheduled` is not being used.
-    pub fn try_send<TL: TransportLayer<SendData>>(&self, tl: TL, seq_cst: bool, packet_data: SendData) -> Result<Option<i64>, (TryError, SendData)> {
+    pub fn try_send<TL: TransportLayer<SendData>>(
+        &self,
+        tl: TL,
+        seq_cst: bool,
+        packet_data: SendData,
+    ) -> Result<Option<i64>, (TrySendError, SendData)> {
         let mut inner = self.inner.lock().unwrap();
+        if inner.closed {
+            return Err((TrySendError::Closed, packet_data));
+        }
         let pre_nst = inner.seq.next_service_timestamp;
-        inner.seq.try_send(tl, seq_cst, packet_data).map(|()| {
-            let nst = inner.seq.next_service_timestamp;
-            (pre_nst > nst).then_some(nst)
-        })
+        inner
+            .seq
+            .try_send(tl, seq_cst, packet_data)
+            .map(|()| {
+                let nst = inner.seq.next_service_timestamp;
+                (pre_nst > nst).then_some(nst)
+            })
+            .map_err(|(e, b)| (e.into(), b))
     }
 
     /// Variant of `SeqEx::send` that allows for a provided function to write data to the send
@@ -538,16 +569,21 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
     /// This function receives the packet sequence number the packet will be assigned.
     /// All calls to `TransportLayer::send` involving this packet will receive this exact same
     /// sequence number.
-    pub fn send_with<TL: TransportLayer<SendData>>(&self, tl: TL, seq_cst: bool, mut packet_data: impl FnOnce(SeqNo) -> SendData) -> Option<i64> {
+    pub fn send_with<TL: TransportLayer<SendData>>(
+        &self,
+        tl: TL,
+        seq_cst: bool,
+        mut f: impl FnOnce(SeqNo) -> SendData,
+    ) -> Result<Option<i64>, ClosedError> {
         let mut inner = self.inner.lock().unwrap();
+        if inner.closed {
+            return Err(ClosedError);
+        }
         let mut pre_nst = inner.seq.next_service_timestamp;
-        while let Err((e, p)) = inner.seq.try_send_with(tl, seq_cst, packet_data) {
-            packet_data = p;
+        while let Err((e, p)) = inner.seq.try_send_with(tl, seq_cst, f) {
+            f = p;
             match e {
                 TryError::WaitingForRecv => {
-                    if inner.is_dead {
-                        return None;
-                    }
                     inner.recv_waiters += 1;
                     inner = self.wait_on_recv.wait(inner).unwrap();
                     inner.recv_waiters -= 1;
@@ -559,15 +595,21 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
                     pre_nst = inner.seq.next_service_timestamp;
                 }
             }
+            if inner.closed {
+                return Err(ClosedError);
+            }
         }
         let nst = inner.seq.next_service_timestamp;
-        (pre_nst > nst).then_some(nst)
+        Ok((pre_nst > nst).then_some(nst))
     }
     /// Add the given `packet_data` to the send window, to be sent immediately, and to be resent
     /// if the payload is not successfully received by the remote peer.
     ///
     /// If the either send or receive window is full, this function will block until they are not.
     /// The amount of time this blocks for can depend on how long it takes the remote peer to respond.
+    ///
+    /// This function can only return `Err(ClosedError)` if the function `SeqEx::close` is called
+    /// while this thread is blocked on this
     ///
     /// By default this function guarantees lossless transport. When `seq_cst` is set to true, this
     /// function also guarantees in-order transport.
@@ -580,16 +622,16 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
     ///
     /// Returns the timestamp of when `service_scheduled` should be called next, only if it has decrease.
     /// This can be safely ignored if `service_scheduled` is not being used.
-    pub fn send<TL: TransportLayer<SendData>>(&self, tl: TL, seq_cst: bool, mut packet_data: SendData) -> Option<i64> {
+    pub fn send<TL: TransportLayer<SendData>>(&self, tl: TL, seq_cst: bool, mut packet_data: SendData) -> Result<Option<i64>, ClosedError> {
         let mut inner = self.inner.lock().unwrap();
+        if inner.closed {
+            return Err(ClosedError);
+        }
         let mut pre_nst = inner.seq.next_service_timestamp;
         while let Err((e, p)) = inner.seq.try_send(tl, seq_cst, packet_data) {
             packet_data = p;
             match e {
                 TryError::WaitingForRecv => {
-                    if inner.is_dead {
-                        return None;
-                    }
                     inner.recv_waiters += 1;
                     inner = self.wait_on_recv.wait(inner).unwrap();
                     inner.recv_waiters -= 1;
@@ -601,32 +643,8 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
                     pre_nst = inner.seq.next_service_timestamp;
                 }
             }
-        }
-        let nst = inner.seq.next_service_timestamp;
-        (pre_nst > nst).then_some(nst)
-    }
-    pub fn send_with_timeout<TL: TransportLayer<SendData>, F: FnOnce(SeqNo) -> SendData>(&self, tl: TL, seq_cst: bool, dur: Duration, mut packet_data: F) -> Result<Option<i64>, F> {
-        let mut inner = self.inner.lock().unwrap();
-        let mut pre_nst = inner.seq.next_service_timestamp;
-        while let Err((e, p)) = inner.seq.try_send_with(tl, seq_cst, packet_data) {
-            packet_data = p;
-            match e {
-                TryError::WaitingForRecv => {
-                    if inner.is_dead {
-                        return Err(packet_data);
-                    }
-                    inner.recv_waiters += 1;
-                    let result = self.wait_on_recv.wait_timeout(inner, dur).unwrap();
-                    inner.recv_waiters -= 1;
-                    result.1.timed_out()
-                    inner = .0;
-                    pre_nst = inner.seq.next_service_timestamp;
-                }
-                TryError::WaitingForReply => {
-                    inner.reply_sender_waiters = true;
-                    inner = self.wait_on_reply.wait(inner).unwrap();
-                    pre_nst = inner.seq.next_service_timestamp;
-                }
+            if inner.closed {
+                return Err(ClosedError);
             }
         }
         let nst = inner.seq.next_service_timestamp;
@@ -656,14 +674,17 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
     /// that schedule whenever `SeqEx::send`, `ReplyGuard::reply` or any of their variants are called.
     ///
     /// It is recommended to just use `SeqEx::service`.
-    pub fn service_scheduled(&self, mut tl: impl TransportLayer<SendData>) -> i64 {
+    pub fn service_scheduled(&self, mut tl: impl TransportLayer<SendData>) -> Result<i64, ClosedError> {
         let mut inner = self.inner.lock().unwrap();
+        if inner.closed {
+            return Err(ClosedError);
+        }
         let current_time = tl.time();
         let mut iter = None;
         while let Some(p) = inner.seq.service_direct(current_time, &mut iter) {
             tl.send(p)
         }
-        inner.seq.next_service_timestamp
+        Ok(inner.seq.next_service_timestamp)
     }
     /// Normally if the send window is full, threads that call into `send` or `send_with` will block
     /// until the remote peer acknowledges some of the packets in the send window.
@@ -671,7 +692,7 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
     /// permanently blocked, unless this function is called.
     ///
     /// This function cause all threads currently waiting for the remote peer to send us acks to
-    /// spuriously unblock and return. Future calls to `send` or `send_with` will spuriously return
+    /// unblock and return. Future calls to `send` or `send_with` will return an error
     /// instead of waiting for the remote peer to send acks.
     /// Any future packets received from the remote peer will be dropped.
     ///
@@ -685,15 +706,22 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
     /// If you are using functions `send` or `send_with`, and are communicating with an unreliable
     /// peer, then threads permanently blocking is a possibility. To avoid this you must implement
     /// some system that will detect if the remote peer has disconnected and call this function.
-    pub fn assume_dead_peer(&self) {
+    pub fn close(&self) {
+        // It is not practical to implement this function as a called-on-drop RAII object.
+        // Since SEQEX does not specify a protocol for closing a session, we have to allow the user
+        // to call this function at any time for any reason.
+        // RAII is good for when you need to guarantee some object is alive when a thread has access
+        // to it, but this is the opposite of the semantics we want for closing a session.
+        // When the user decides to close a session, this instance of `SeqEx` needs to immediately
+        // close even while other threads have access to it.
         let mut inner = self.inner.lock().unwrap();
-        inner.is_dead = true;
+        inner.closed = true;
         self.notify_recv(inner);
     }
-    /// Return whether or not `assume_dead_peer` has previously been called on this instance of `SeqEx`.
-    pub fn is_dead(&self) -> bool {
+    /// Return whether or not `close` has previously been called on this instance of `SeqEx`.
+    pub fn is_closed(&self) -> bool {
         let inner = self.inner.lock().unwrap();
-        inner.is_dead
+        inner.closed
     }
 }
 impl<SendData, RecvData, const CAP: usize> Default for SeqEx<SendData, RecvData, CAP> {

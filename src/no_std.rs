@@ -1,7 +1,7 @@
 pub use crate::single_thread::*;
 
 use crate::{
-    error::{TryError, TryRecvError},
+    error::{TryError, TryRawRecvError},
     transport_layer::SeqNo,
     Packet, DEFAULT_INITIAL_SEQ_NO, DEFAULT_RESEND_INTERVAL_MS, DEFAULT_WINDOW_CAP,
 };
@@ -211,10 +211,10 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
         &mut self,
         current_time: i64,
         seq_cst: bool,
-        packet_data: F,
+        f: F,
     ) -> Result<Packet<&SendData>, (TryError, F)> {
         if let Err(e) = self.is_full_inner(None) {
-            return Err((e, packet_data));
+            return Err((e, f));
         }
 
         let seq_no = self.next_send_seq_no;
@@ -231,7 +231,7 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
             reply_no: None,
             seq_cst,
             next_resend_time,
-            data: packet_data(seq_no),
+            data: f(seq_no),
         });
 
         Ok(entry.to_packet())
@@ -254,7 +254,7 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
     }
 
     /// If this returns `Ok` then `try_send` might succeed on next call.
-    pub fn receive_raw_and_direct<P: Into<RecvData>>(&mut self, packet: Packet<P>) -> Result<(RecvOkRaw<SendData, P>, bool), TryRecvError> {
+    pub fn try_receive_raw_and_direct<P: Into<RecvData>>(&mut self, packet: Packet<P>) -> Result<(RecvOkRaw<SendData, P>, bool), TryRawRecvError> {
         let seq_cst = packet.is_seq_cst();
         let (seq_no, reply_no, recv_data) = match packet {
             Payload(seq_no, recv_data) | SeqCstPayload(seq_no, recv_data) => (seq_no, None, recv_data),
@@ -263,7 +263,7 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
                 return self
                     .take_send(reply_no)
                     .map(|send_data| (RecvOkRaw::Ack { send_data }, false))
-                    .ok_or(TryRecvError::DroppedDuplicate)
+                    .ok_or(TryRawRecvError::DroppedDuplicate)
             }
         };
         // We only want to accept packets with sequence numbers in the range:
@@ -286,17 +286,17 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
             // resending the packet.
             for entry in self.send_window.iter().flatten() {
                 if entry.reply_no == Some(seq_no) {
-                    return Err(TryRecvError::DroppedDuplicate);
+                    return Err(TryRawRecvError::DroppedDuplicate);
                 }
             }
             for i in 0..self.concurrent_replies_total {
                 if self.concurrent_replies[i] == seq_no {
-                    return Err(TryRecvError::DroppedDuplicate);
+                    return Err(TryRawRecvError::DroppedDuplicate);
                 }
             }
-            return Err(TryRecvError::DroppedDuplicateResendAck(seq_no));
+            return Err(TryRawRecvError::DroppedDuplicateResendAck(seq_no));
         } else if is_above_range {
-            return Err(TryRecvError::DroppedTooEarly);
+            return Err(TryRawRecvError::DroppedTooEarly);
         }
 
         // Check whether or not we've already received this packet
@@ -322,9 +322,9 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
                 self.recv_window[i] = RecvEntry::Occupied { seq_no, reply_no, seq_cst, data: recv_data.into() }
             }
             return if wait_recv {
-                Err(TryRecvError::WaitingForRecv)
+                Err(TryRawRecvError::WaitingForRecv)
             } else {
-                Err(TryRecvError::WaitingForReply)
+                Err(TryRawRecvError::WaitingForReply)
             };
         }
 

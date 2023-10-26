@@ -52,7 +52,7 @@ fn main() {
     let seq2 = SeqEx::default();
 
     // We begin a "Hello World" exchange right here.
-    seq1.send(&transport1, false, Payload::Hello);
+    seq1.send(&transport1, false, Payload::Hello).unwrap();
 
     receive(&recv2, &seq2, &transport2);
     receive(&recv1, &seq1, &transport1);
