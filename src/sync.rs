@@ -608,8 +608,8 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
     /// If the either send or receive window is full, this function will block until they are not.
     /// The amount of time this blocks for can depend on how long it takes the remote peer to respond.
     ///
-    /// This function can only return `Err(ClosedError)` if the function `SeqEx::close` is called
-    /// while this thread is blocked on this
+    /// This function can only return `Err(ClosedError)` if the function `SeqEx::close` has
+    /// previously been called on this instance of `SeqEx`.
     ///
     /// By default this function guarantees lossless transport. When `seq_cst` is set to true, this
     /// function also guarantees in-order transport.
@@ -686,26 +686,28 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
         }
         Ok(inner.seq.next_service_timestamp)
     }
+    /// When this function is called, sending and receiving packets is immediately disabled for this
+    /// instance of `SeqEx`. Nothing else will be disabled, it will still be possible to empty any
+    /// packets left in the receive window with `pump`.
+    ///
     /// Normally if the send window is full, threads that call into `send` or `send_with` will block
     /// until the remote peer acknowledges some of the packets in the send window.
-    /// If the remote peer does not send these acknowledgements, then these threads will be
+    /// If the remote peer never sends an acknowledgement, then these threads will be
     /// permanently blocked, unless this function is called.
     ///
-    /// This function cause all threads currently waiting for the remote peer to send us acks to
-    /// unblock and return. Future calls to `send` or `send_with` will return an error
-    /// instead of waiting for the remote peer to send acks.
-    /// Any future packets received from the remote peer will be dropped.
+    /// This function causes all threads currently waiting for the remote peer to send an ack to
+    /// unblock and return an error.
+    /// Future calls to `send` or `send_with` will return an error instead of blocking.
+    /// All future packets received from the remote peer will be dropped and an error will be returned.
     ///
-    /// Threads will still be able to `pump` and process anything left in the receive window, and
-    /// the critical section of SeqCst packets will be maintained. Calls to `service` will still
-    /// attempt to resend packets.
+    /// Calling this function can cause data loss due to packets being dropped from the send window,
+    /// but it will maintain state synchronization with the remote peer up to the moment it was
+    /// called.
     ///
-    /// Calling this function can cause data loss, but it will maintain state synchronization up to the
-    /// moment it was called, and prevent permanent blocking.
-    ///
-    /// If you are using functions `send` or `send_with`, and are communicating with an unreliable
-    /// peer, then threads permanently blocking is a possibility. To avoid this you must implement
-    /// some system that will detect if the remote peer has disconnected and call this function.
+    /// If you are using functions `send` or `send_with`,
+    /// and are communicating with an unreliable peer, then threads permanently blocking on send
+    /// is a possibility. To avoid this you must implement some system that will detect if the
+    /// remote peer has disconnected and then call this function when.
     pub fn close(&self) {
         // It is not practical to implement this function as a called-on-drop RAII object.
         // Since SEQEX does not specify a protocol for closing a session, we have to allow the user

@@ -80,6 +80,11 @@ pub enum RecvError {
     /// If the receive window was full, the packet was dropped.
     /// Otherwise if the packet is SeqCst, then the packet was saved to the receive window.
     WaitingForReply,
+    /// This instance of `SeqEx` has been explicitly closed.
+    /// It can no longer send or receive data.
+    ///
+    /// This error can only occur after `SeqEx::close` has been called.
+    /// An instance of `SeqEx` will never close by itself, only the caller can close it.
     Closed,
 }
 
@@ -108,6 +113,11 @@ pub enum TrySendError {
     /// consumed.
     /// Until this occurs the packet cannot be sent or processed.
     WaitingForReply,
+    /// This instance of `SeqEx` has been explicitly closed.
+    /// It can no longer send or receive data.
+    ///
+    /// This error can only occur after `SeqEx::close` has been called.
+    /// An instance of `SeqEx` will never close by itself, only the caller can close it.
     Closed,
 }
 /// This instance of `SeqEx` has been explicitly closed.
