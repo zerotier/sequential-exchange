@@ -58,5 +58,9 @@ mod single_thread;
 pub mod sync;
 
 /// This module contains the API for using SEQEX safely with tokio for async-await style code.
+///
+/// There is a known issue with this API that it currently exposes no direct way to close a session
+/// and cause all paused awaits to return. The user can currently implement this with async timeouts
+/// or an async "session closed" event.
 #[cfg(feature = "tokio")]
 pub mod tokio;
