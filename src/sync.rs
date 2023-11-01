@@ -695,8 +695,8 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
         &self,
         mut tl: TL,
         seq_cst: bool,
-        mut packet_data: SendData,
         timeout: i64,
+        mut packet_data: SendData,
     ) -> Result<Option<i64>, (TrySendError, SendData)> {
         send!(self, tl, seq_cst, packet_data, try_send, timeout)
     }
@@ -715,8 +715,8 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
         &self,
         mut tl: TL,
         seq_cst: bool,
-        mut f: F,
         timeout: i64,
+        mut f: F,
     ) -> Result<Option<i64>, (TrySendError, F)> {
         send!(self, tl, seq_cst, f, try_send_with, timeout)
     }
