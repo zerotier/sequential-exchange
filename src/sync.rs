@@ -3,7 +3,7 @@ use std::{
         mpsc::{channel, Receiver, Sender},
         Condvar, Mutex, MutexGuard,
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use crate::{no_std::RecvOkRaw, Packet, SeqNo, TransportLayer, DEFAULT_INITIAL_SEQ_NO, DEFAULT_RESEND_INTERVAL_MS, DEFAULT_WINDOW_CAP};
@@ -335,6 +335,81 @@ pub struct RecvIter<'a, TL: TransportLayer<SendData>, SendData, RecvData, const 
     blocking: bool,
 }
 
+macro_rules! send {
+    ($self:ident, $tl:ident, $seq_cst:ident, $data:ident, $try_send:tt) => {{
+        let mut inner = $self.inner.lock().unwrap();
+        if inner.closed {
+            return Err(ClosedError);
+        }
+        let mut pre_nst = inner.seq.next_service_timestamp;
+        while let Err((e, d)) = inner.seq.$try_send($tl, $seq_cst, $data) {
+            $data = d;
+            match e {
+                TryError::WaitingForRecv => {
+                    inner.recv_waiters += 1;
+                    inner = $self.wait_on_recv.wait(inner).unwrap();
+                    inner.recv_waiters -= 1;
+                    pre_nst = inner.seq.next_service_timestamp;
+                }
+                TryError::WaitingForReply => {
+                    inner.reply_sender_waiters = true;
+                    inner = $self.wait_on_reply.wait(inner).unwrap();
+                    pre_nst = inner.seq.next_service_timestamp;
+                }
+            }
+            if inner.closed {
+                return Err(ClosedError);
+            }
+        }
+        let nst = inner.seq.next_service_timestamp;
+        Ok((pre_nst > nst).then_some(nst))
+    }};
+    ($self:ident, $tl:ident, $seq_cst:ident, $data:ident, $try_send:tt, $timeout:ident) => {{
+        let mut inner = $self.inner.lock().unwrap();
+        if inner.closed {
+            return Err((TrySendError::Closed, $data));
+        }
+        let mut pre_nst = inner.seq.next_service_timestamp;
+        let mut start_time = $tl.time();
+        let end_time = start_time.saturating_add($timeout);
+        while let Err((e, p)) = inner.seq.$try_send($tl, $seq_cst, $data) {
+            $data = p;
+            match e {
+                TryError::WaitingForRecv => {
+                    inner.recv_waiters += 1;
+                    (inner, _) = $self
+                        .wait_on_recv
+                        .wait_timeout(inner, Duration::from_millis((end_time - start_time) as u64))
+                        .unwrap();
+                    start_time = $tl.time();
+                    inner.recv_waiters -= 1;
+                    pre_nst = inner.seq.next_service_timestamp;
+                    if end_time <= start_time {
+                        return Err((TrySendError::WaitingForRecv, $data));
+                    }
+                }
+                TryError::WaitingForReply => {
+                    inner.reply_sender_waiters = true;
+                    (inner, _) = $self
+                        .wait_on_reply
+                        .wait_timeout(inner, Duration::from_millis((end_time - start_time) as u64))
+                        .unwrap();
+                    start_time = $tl.time();
+                    pre_nst = inner.seq.next_service_timestamp;
+                    if end_time <= start_time {
+                        return Err((TrySendError::WaitingForReply, $data));
+                    }
+                }
+            }
+            if inner.closed {
+                return Err((TrySendError::Closed, $data));
+            }
+        }
+        let nst = inner.seq.next_service_timestamp;
+        Ok((pre_nst > nst).then_some(nst))
+    }};
+}
+
 impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
     /// Creates a new instance of SeqEx.
     ///
@@ -394,9 +469,9 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
                 Ok((RecvOk::from_raw(self, tl, r), do_pump))
             }
             Err(e) => Err(match e {
-                crate::no_std::TryRecvError::DroppedTooEarly => TryRecvError::DroppedTooEarly,
-                crate::no_std::TryRecvError::DroppedDuplicate => TryRecvError::DroppedDuplicate,
-                crate::no_std::TryRecvError::WaitingForRecv => TryRecvError::WaitingForRecv,
+                crate::no_std::TryRecvError::DroppedTooEarly
+                | crate::no_std::TryRecvError::DroppedDuplicate
+                | crate::no_std::TryRecvError::WaitingForRecv => TryRecvError::OutOfSequence,
                 crate::no_std::TryRecvError::WaitingForReply => TryRecvError::WaitingForReply,
             }),
         }
@@ -424,18 +499,11 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
         match self.try_receive(tl, packet) {
             Ok(r) => Ok(r),
             Err(e) => match e {
-                TryRecvError::WaitingForReply => self.pump(tl).ok_or(RecvError::WaitingForRecv),
-                TryRecvError::WaitingForRecv => Err(RecvError::WaitingForRecv),
-                TryRecvError::DroppedTooEarly => Err(RecvError::DroppedTooEarly),
-                TryRecvError::DroppedDuplicate => Err(RecvError::DroppedDuplicate),
+                TryRecvError::WaitingForReply => self.pump(tl).ok_or(RecvError::OutOfSequence),
+                TryRecvError::OutOfSequence => Err(RecvError::OutOfSequence),
                 TryRecvError::Closed => Err(RecvError::Closed),
             },
         }
-        //if let Err(TryRecvError::WaitingForReply) = result {
-        //    self.pump(tl).ok_or(RecvError::WaitingForRecv)
-        //} else {
-        //    result
-        //}
     }
     /// Non-blocking variant of `SeqEx::pump`.
     /// See the documentation for `SeqEx::pump` for more information.
@@ -454,7 +522,7 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
     /// Check if there are any packets in the receive window that can be processed.
     ///
     /// This function may block to preserve lossless or in-order transport.
-    /// It will never block if the receive window is empty.
+    /// It will never block if the receive window is empty (a.k.a. there is no data to receive).
     ///
     /// If this function returns `Some`, the contained boolean is true if `SeqEx::pump` should be
     /// called another time, because there are still packets ready to be processed in the receive window.
@@ -587,32 +655,7 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
         seq_cst: bool,
         mut f: impl FnOnce(SeqNo) -> SendData,
     ) -> Result<Option<i64>, ClosedError> {
-        let mut inner = self.inner.lock().unwrap();
-        if inner.closed {
-            return Err(ClosedError);
-        }
-        let mut pre_nst = inner.seq.next_service_timestamp;
-        while let Err((e, p)) = inner.seq.try_send_with(tl, seq_cst, f) {
-            f = p;
-            match e {
-                TryError::WaitingForRecv => {
-                    inner.recv_waiters += 1;
-                    inner = self.wait_on_recv.wait(inner).unwrap();
-                    inner.recv_waiters -= 1;
-                    pre_nst = inner.seq.next_service_timestamp;
-                }
-                TryError::WaitingForReply => {
-                    inner.reply_sender_waiters = true;
-                    inner = self.wait_on_reply.wait(inner).unwrap();
-                    pre_nst = inner.seq.next_service_timestamp;
-                }
-            }
-            if inner.closed {
-                return Err(ClosedError);
-            }
-        }
-        let nst = inner.seq.next_service_timestamp;
-        Ok((pre_nst > nst).then_some(nst))
+        send!(self, tl, seq_cst, f, try_send_with)
     }
     /// Add the given `packet_data` to the send window, to be sent immediately, and to be resent
     /// if the payload is not successfully received by the remote peer.
@@ -635,32 +678,47 @@ impl<SendData, RecvData, const CAP: usize> SeqEx<SendData, RecvData, CAP> {
     /// Returns the timestamp of when `service_scheduled` should be called next, only if it has decrease.
     /// This can be safely ignored if `service_scheduled` is not being used.
     pub fn send<TL: TransportLayer<SendData>>(&self, tl: TL, seq_cst: bool, mut packet_data: SendData) -> Result<Option<i64>, ClosedError> {
-        let mut inner = self.inner.lock().unwrap();
-        if inner.closed {
-            return Err(ClosedError);
-        }
-        let mut pre_nst = inner.seq.next_service_timestamp;
-        while let Err((e, p)) = inner.seq.try_send(tl, seq_cst, packet_data) {
-            packet_data = p;
-            match e {
-                TryError::WaitingForRecv => {
-                    inner.recv_waiters += 1;
-                    inner = self.wait_on_recv.wait(inner).unwrap();
-                    inner.recv_waiters -= 1;
-                    pre_nst = inner.seq.next_service_timestamp;
-                }
-                TryError::WaitingForReply => {
-                    inner.reply_sender_waiters = true;
-                    inner = self.wait_on_reply.wait(inner).unwrap();
-                    pre_nst = inner.seq.next_service_timestamp;
-                }
-            }
-            if inner.closed {
-                return Err(ClosedError);
-            }
-        }
-        let nst = inner.seq.next_service_timestamp;
-        Ok((pre_nst > nst).then_some(nst))
+        send!(self, tl, seq_cst, packet_data, try_send)
+    }
+    /// Variant of `SeqEx::send` that will block at most around `timeout` milliseconds before unblocking.
+    ///
+    /// A return value of `Err(TrySendError::WaitingForRecv)` signals that this function timed-out
+    /// while it was waiting to receive an acknowledgement from the remote peer.
+    /// A return value of `Err(TrySendError::WaitingForReply)` signals that this function timed-out
+    /// while it was waiting for a delinquent `ReplyGuard` to be dropped.
+    /// It is guaranteed that, if this function times-out, at least `timeout` milliseconds have passed.
+    /// So this function will not spuriously return.
+    ///
+    /// This and `send_with_timeout` are the only functions capable of calling `tl.time()`
+    /// more than once. So `tl.time()` should be accurate and monotonically increasing.
+    pub fn send_timeout<TL: TransportLayer<SendData>>(
+        &self,
+        mut tl: TL,
+        seq_cst: bool,
+        mut packet_data: SendData,
+        timeout: i64,
+    ) -> Result<Option<i64>, (TrySendError, SendData)> {
+        send!(self, tl, seq_cst, packet_data, try_send, timeout)
+    }
+    /// Variant of `SeqEx::send_with` that will block at most around `timeout` milliseconds before unblocking.
+    ///
+    /// A return value of `Err(TrySendError::WaitingForRecv)` signals that this function timed out
+    /// while it was waiting to receive an acknowledgement from the remote peer.
+    /// A return value of `Err(TrySendError::WaitingForReply)` signals that this function timed out
+    /// while it was waiting for a delinquent `ReplyGuard` to be dropped.
+    /// It is guaranteed that, if this function times-out, at least `timeout` milliseconds have passed.
+    /// So this function will not spuriously return.
+    ///
+    /// This and `send_timeout` are the only functions capable of calling `tl.time()`
+    /// more than once. So `tl.time()` should be accurate and monotonically increasing.
+    pub fn send_with_timeout<TL: TransportLayer<SendData>, F: FnOnce(SeqNo) -> SendData>(
+        &self,
+        mut tl: TL,
+        seq_cst: bool,
+        mut f: F,
+        timeout: i64,
+    ) -> Result<Option<i64>, (TrySendError, F)> {
+        send!(self, tl, seq_cst, f, try_send_with, timeout)
     }
     /// Function which handles resending unacknowledged packets.
     /// It returns the duration of time in milliseconds that should be waited
@@ -815,17 +873,9 @@ pub enum TryRecvError {
     /// If the receive window was full, the packet was dropped.
     /// Otherwise if the packet is SeqCst, then the packet was saved to the receive window.
     WaitingForReply,
-    /// In order to preserve losslessness or in-order transport, the received packet cannot be
-    /// process until some other packet is received. The packet was saved to the receive window.
-    WaitingForRecv,
-    /// This packet had to be dropped because it arrived far enough out-of-order that it was outside
-    /// the receive window.
-    /// This packet will eventually be resent, so no data will be lost.
-    DroppedTooEarly,
-    /// This packet was a duplicate of a previously received packet. It must have been resent before
-    /// the remote peer received the ack for the packet.
-    /// Since this packet is a duplicate, no data is lost by dropping it.
-    DroppedDuplicate,
+    /// The packet was received but cannot be processed yet to preserve losslessness or
+    /// in-order transport. No action needs to be taken by the caller.
+    OutOfSequence,
     /// This instance of `SeqEx` has been explicitly closed.
     /// It can no longer send or receive data.
     ///
@@ -838,17 +888,9 @@ pub enum TryRecvError {
 /// Some of these errors specify that SEQEX is waiting on some event to occur before it can proceed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecvError {
-    /// In order to preserve losslessness or in-order transport, the received packet cannot be
-    /// process until some other packet is received. The packet was saved to the receive window.
-    WaitingForRecv,
-    /// This packet had to be dropped because it arrived far enough out-of-order that it was outside
-    /// the receive window.
-    /// This packet will eventually be resent, so no data will be lost.
-    DroppedTooEarly,
-    /// This packet was a duplicate of a previously received packet. It must have been resent before
-    /// the remote peer received the ack for the packet.
-    /// Since this packet is a duplicate, no data is lost by dropping it.
-    DroppedDuplicate,
+    /// The packet was received but cannot be processed yet to preserve losslessness or
+    /// in-order transport. No action needs to be taken by the caller.
+    OutOfSequence,
     /// This instance of `SeqEx` has been explicitly closed.
     /// It can no longer send or receive data.
     ///
@@ -856,17 +898,21 @@ pub enum RecvError {
     /// An instance of `SeqEx` will never close by itself, only the caller can close it.
     Closed,
 }
-/// A generic error that can be returned by a `try_send` or `try_pump` function.
+/// A generic error that can be returned by a `try_send` or `send_timeout` function.
 /// They specify what event must occur before a future call to `try_send` or `try_pump` can succeed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrySendError {
-    /// The packet could not be sent or processed at this time.
-    /// Some other packet must be received from the remote peer first.
+    /// The packet could not be sent at this time because the send window is full.
+    /// Acknowledgements must be received from the remote peer to empty the send window.
+    ///
+    /// If this error is returned by a `send_timeout` function, then the function timed-out.
     WaitingForRecv,
     /// Some currently issued reply number must be returned to SEQEX to send either an Ack or a
     /// Reply. If using reply guards, then some currently existing reply guard must be dropped or
     /// consumed.
     /// Until this occurs the packet cannot be sent or processed.
+    ///
+    /// If this error is returned by a `send_timeout` function, then the function timed-out.
     WaitingForReply,
     /// This instance of `SeqEx` has been explicitly closed.
     /// It can no longer send or receive data.
@@ -875,7 +921,6 @@ pub enum TrySendError {
     /// An instance of `SeqEx` will never close by itself, only the caller can close it.
     Closed,
 }
-
 /// This instance of `SeqEx` has been explicitly closed.
 /// It can no longer send or receive data.
 ///
@@ -887,9 +932,7 @@ pub struct ClosedError;
 impl std::fmt::Display for TryRecvError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::DroppedTooEarly => write!(f, "packet arrived too early"),
-            Self::DroppedDuplicate => write!(f, "packet was a duplicate"),
-            Self::WaitingForRecv => write!(f, "can't process packet until another packet is received"),
+            Self::OutOfSequence => write!(f, "packet arrived but cannot yet be processed"),
             Self::WaitingForReply => write!(f, "can't process packet until a reply is finished"),
             Self::Closed => write!(f, "can't receive packet because the session was explicitly closed"),
         }
@@ -928,9 +971,7 @@ impl std::error::Error for ClosedError {}
 impl From<RecvError> for TryRecvError {
     fn from(value: RecvError) -> Self {
         match value {
-            RecvError::WaitingForRecv => TryRecvError::WaitingForRecv,
-            RecvError::DroppedTooEarly => TryRecvError::DroppedTooEarly,
-            RecvError::DroppedDuplicate => TryRecvError::DroppedDuplicate,
+            RecvError::OutOfSequence => TryRecvError::OutOfSequence,
             RecvError::Closed => TryRecvError::Closed,
         }
     }
