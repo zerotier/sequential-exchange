@@ -12,9 +12,9 @@ SEQEX is a tiny, dead simple protocol and we have implemented it here in around 
 
 SEQEX is transport agnostic. It does not require being run over a single UDP socket. This allows SEQEX to easily be run over an encrypted tunnel that itself can run over as many or as few UDP sockets as necessary, if indeed UDP is even available. An instance of the SEQEX protocol can be forced to persist through a connection reset event, avoiding common issues with TCP where connection resets can cause unrecoverable packet loss.
 
-SEQEX is serialization agnostic, meaning its packets have no pre-defined encoding format. Users of SEQEX are free to choose between serde, packed structs, tagged unions, or anything else as their prefered serialization format. This means SEQEX takes some additional effort to set up up-front, but it means that user have significantly more flexibility long-term.
+SEQEX is serialization agnostic, meaning its packets have no pre-defined encoding format. Users of SEQEX are free to choose between serde, packed structs, tagged unions, or anything else as their preferred serialization format. This means SEQEX takes some additional effort to set up up-front, but it means that user have significantly more flexibility long-term.
 
-As such it is relatively easier to run SEQEX in parrallel with another raw UDP protocol, or even in parrallel with itself. Multiple instances of SEQEX can be opened between two peers, making it very easy to reduce or even eliminate head-of-line latency in performance critical applications.
+As such it is relatively easier to run SEQEX in parallel with another raw UDP protocol, or even in parallel with itself. Multiple instances of SEQEX can be opened between two peers, making it very easy to reduce or even eliminate head-of-line latency in performance critical applications.
 
 ## Why not TCP?
 
