@@ -28,8 +28,13 @@ features that slow down runtime regardless of whether or not they are used.
 A lot of this overhead owes to TCPs sizeable complexity.
 
 That being said SEQEX does lack many of TCP's additional features, such as a dynamic resend timer,
-keep-alives, and fragmentation. This can be both a pro and a con, as it means there is a
+keep-alives, fragmentation and rate-limiting. This can be both a pro and a con, as it means there is a
 lot of efficiency to be gained if these features are not needed or are implemented at a
 different protocol layer.
+
+TCP is also ossified into the infrasctructure of the internet.
+There are many hardware accelerated implementations of TCP that are faster than this implementation of SEQEX.
+Many routers, firewalls and other middleboxes grant it access priviledges not granted to UDP.
+Though it is increasingly common for middleboxes to modify TCP traffic owing to TCP's lack of encryption.
 
 Neither SEQEX nor TCP are cryptographically secure.
